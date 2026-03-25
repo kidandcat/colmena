@@ -1,6 +1,18 @@
-# Colmena
+<p align="center">
+  <img src="banner.png" alt="Colmena" width="700">
+</p>
 
-Distributed SQLite as an embeddable Go library. No CGo, no external processes — just `import` and go.
+<h1 align="center">Colmena</h1>
+
+<p align="center">
+  Distributed SQLite as an embeddable Go library. No CGo, no external processes — just <code>import</code> and go.
+</p>
+
+<p align="center">
+  <a href="https://pkg.go.dev/github.com/kidandcat/colmena"><img src="https://pkg.go.dev/badge/github.com/kidandcat/colmena.svg" alt="Go Reference"></a>
+  <a href="https://github.com/kidandcat/colmena/actions"><img src="https://img.shields.io/badge/coverage-80.7%25-brightgreen" alt="Coverage"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSD--3--Clause-blue" alt="License"></a>
+</p>
 
 Colmena combines [hashicorp/raft](https://github.com/hashicorp/raft) for consensus with [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite) for storage, exposing a standard `database/sql` interface. Every node in the cluster holds a full copy of the database.
 

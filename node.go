@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 )
@@ -68,6 +69,10 @@ func New(cfg Config) (*Node, error) {
 	// Setup Raft.
 	raftConfig := raft.DefaultConfig()
 	raftConfig.LocalID = raft.ServerID(cfg.NodeID)
+	raftConfig.Logger = hclog.New(&hclog.LoggerOptions{
+		Output: cfg.LogOutput,
+		Level:  hclog.Warn,
+	})
 	raftConfig.HeartbeatTimeout = cfg.HeartbeatTimeout
 	raftConfig.ElectionTimeout = cfg.ElectionTimeout
 	raftConfig.LeaderLeaseTimeout = cfg.HeartbeatTimeout
@@ -80,7 +85,7 @@ func New(cfg Config) (*Node, error) {
 		st.close()
 		return nil, fmt.Errorf("colmena: resolve advertise addr: %w", err)
 	}
-	transport, err := raft.NewTCPTransport(cfg.Bind, advertise, cfg.MaxPool, 10*time.Second, os.Stderr)
+	transport, err := raft.NewTCPTransport(cfg.Bind, advertise, cfg.MaxPool, 10*time.Second, cfg.LogOutput)
 	if err != nil {
 		st.close()
 		return nil, fmt.Errorf("colmena: create transport: %w", err)
@@ -96,7 +101,7 @@ func New(cfg Config) (*Node, error) {
 	}
 
 	// Snapshot store.
-	snapshotStore, err := raft.NewFileSnapshotStore(cfg.DataDir, 2, os.Stderr)
+	snapshotStore, err := raft.NewFileSnapshotStore(cfg.DataDir, 2, cfg.LogOutput)
 	if err != nil {
 		st.close()
 		return nil, fmt.Errorf("colmena: create snapshot store: %w", err)

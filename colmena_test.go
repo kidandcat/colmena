@@ -69,7 +69,7 @@ func testJoinNode(t *testing.T, joinAddr string) *Node {
 	return node
 }
 
-func freePort(t *testing.T) int {
+func freePort(t testing.TB) int {
 	t.Helper()
 	// Use port 0 to get a free port, but we need two consecutive ports (Raft + RPC).
 	// Find a pair of free ports by trying.

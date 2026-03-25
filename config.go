@@ -2,7 +2,9 @@ package colmena
 
 import (
 	"fmt"
+	"io"
 	"net"
+	"os"
 	"time"
 )
 
@@ -55,6 +57,10 @@ type Config struct {
 	// Backup enables continuous backup when set. The backup engine streams
 	// WAL changes and takes periodic snapshots to the configured backend.
 	Backup *BackupConfig
+
+	// LogOutput controls where Raft logs go. Default: os.Stderr.
+	// Set to io.Discard to suppress logs.
+	LogOutput io.Writer
 
 	// OnApply is called after each command is applied to the local SQLite,
 	// on every node (leader and followers). Useful for reactive applications
@@ -114,5 +120,8 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Advertise == "" {
 		c.Advertise = c.Bind
+	}
+	if c.LogOutput == nil {
+		c.LogOutput = os.Stderr
 	}
 }

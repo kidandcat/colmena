@@ -98,11 +98,6 @@ func (s *store) query(sqlStr string, args ...any) (*sql.Rows, error) {
 	return s.reader.Query(sqlStr, args...)
 }
 
-// queryRow runs a single-row read query on the reader pool.
-func (s *store) queryRow(sqlStr string, args ...any) *sql.Row {
-	return s.reader.QueryRow(sqlStr, args...)
-}
-
 // snapshot writes a full copy of the database to w using SQLite's backup API.
 func (s *store) snapshot(w io.Writer) error {
 	// Use a read transaction to get a consistent snapshot.
@@ -166,7 +161,7 @@ func (s *store) restore(r io.Reader) error {
 
 func (s *store) close() error {
 	var firstErr error
-	if err := s.reader.Close(); err != nil && firstErr == nil {
+	if err := s.reader.Close(); err != nil {
 		firstErr = err
 	}
 	if err := s.writer.Close(); err != nil && firstErr == nil {

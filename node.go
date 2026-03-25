@@ -205,7 +205,7 @@ func (n *Node) Close() error {
 	}
 
 	if n.db != nil {
-		if err := n.db.Close(); err != nil && firstErr == nil {
+		if err := n.db.Close(); err != nil {
 			firstErr = err
 		}
 	}
@@ -365,11 +365,9 @@ func (n *Node) forwardQuery(sqlStr string, args []any) (*RPCQueryResponse, error
 		return nil, fmt.Errorf("colmena: connect to leader: %w", err)
 	}
 
-	// Convert args to []interface{} for JSON serialization.
-	iArgs := make([]interface{}, len(args))
-	for i, a := range args {
-		iArgs[i] = a
-	}
+	// Convert args to []any for JSON serialization.
+	iArgs := make([]any, len(args))
+	copy(iArgs, args)
 
 	req := &RPCQueryRequest{SQL: sqlStr, Args: iArgs}
 	var resp RPCQueryResponse
@@ -470,9 +468,7 @@ func (s *RPCService) Execute(req *RPCExecuteRequest, resp *RPCExecuteResponse) e
 func (s *RPCService) Query(req *RPCQueryRequest, resp *RPCQueryResponse) error {
 	// Execute the query on the leader's local store.
 	iArgs := make([]any, len(req.Args))
-	for i, a := range req.Args {
-		iArgs[i] = a
-	}
+	copy(iArgs, req.Args)
 
 	rows, err := s.node.store.query(req.SQL, iArgs...)
 	if err != nil {
@@ -489,8 +485,8 @@ func (s *RPCService) Query(req *RPCQueryRequest, resp *RPCQueryResponse) error {
 	resp.Columns = cols
 
 	for rows.Next() {
-		values := make([]interface{}, len(cols))
-		valuePtrs := make([]interface{}, len(cols))
+		values := make([]any, len(cols))
+		valuePtrs := make([]any, len(cols))
 		for i := range values {
 			valuePtrs[i] = &values[i]
 		}

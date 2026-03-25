@@ -246,11 +246,22 @@ func (r *wrappedRows) Next(dest []driver.Value) error {
 		}
 		return io.EOF
 	}
-	scanArgs := make([]interface{}, len(dest))
-	for i := range dest {
-		scanArgs[i] = &dest[i]
+	// Scan into []any intermediaries instead of *driver.Value directly.
+	// The database/sql convertAssign function does not support scanning nil
+	// (NULL) into *driver.Value, so we use plain *interface{} targets and
+	// copy the results back into dest afterwards.
+	holders := make([]any, len(dest))
+	scanArgs := make([]any, len(dest))
+	for i := range holders {
+		scanArgs[i] = &holders[i]
 	}
-	return r.sqlRows.Scan(scanArgs...)
+	if err := r.sqlRows.Scan(scanArgs...); err != nil {
+		return err
+	}
+	for i, v := range holders {
+		dest[i] = v
+	}
+	return nil
 }
 
 // rpcRows wraps RPC query results to implement driver.Rows.
@@ -271,7 +282,7 @@ func (r *rpcRows) Next(dest []driver.Value) error {
 	row := r.data[r.pos]
 	r.pos++
 	for i, raw := range row {
-		var v interface{}
+		var v any
 		json.Unmarshal(raw, &v)
 		dest[i] = v
 	}
@@ -280,8 +291,8 @@ func (r *rpcRows) Next(dest []driver.Value) error {
 
 // --- Helpers ---
 
-func namedToInterface(args []driver.NamedValue) []interface{} {
-	result := make([]interface{}, len(args))
+func namedToInterface(args []driver.NamedValue) []any {
+	result := make([]any, len(args))
 	for i, a := range args {
 		result[i] = a.Value
 	}

@@ -184,14 +184,38 @@ backend, _ := s3.NewBackend(s3.Config{
 ```go
 node, _ := colmena.New(colmena.Config{
     // ...
-    OnApply: func(stmts []colmena.Statement, results []colmena.ExecResult) {
+    OnApply: func(db string, stmts []colmena.Statement, results []colmena.ExecResult) {
         for _, stmt := range stmts {
             if strings.HasPrefix(stmt.SQL, "INSERT INTO events") {
-                notifySubscribers(stmt.Args)
+                notifySubscribers(db, stmt.Args)
             }
         }
     },
 })
+```
+
+## Multiple Databases
+
+A single Raft cluster can host multiple independent SQLite databases, each with its own default consistency level. Each database maps to a separate `.db` file on disk.
+
+```go
+node, _ := colmena.New(colmena.Config{...})
+
+mainDB     := node.OpenDB("main", colmena.ConsistencyWeak)
+logsDB     := node.OpenDB("logs", colmena.ConsistencyNone)
+accountsDB := node.OpenDB("accounts", colmena.ConsistencyStrong)
+
+// Backward compatible — same as node.OpenDB("default", config.Consistency)
+defaultDB := node.DB()
+```
+
+Each database is fully isolated: tables created in one database are not visible in another. Writes to different databases go through the same Raft log, so they share the cluster's write throughput. Reads are independent since each database has its own reader pool.
+
+You can still override the consistency level per-query using `WithConsistency`:
+
+```go
+ctx := colmena.WithConsistency(ctx, colmena.ConsistencyStrong)
+rows, _ := logsDB.QueryContext(ctx, "SELECT ...")
 ```
 
 ## Configuration
@@ -214,7 +238,7 @@ colmena.Config{
     SQLiteReadConns   int               // Reader pool size. Default: 4.
     LogOutput         io.Writer         // Raft log output. Default: os.Stderr.
     Backup            *BackupConfig     // Continuous backup config. Optional.
-    OnApply           func([]Statement, []ExecResult)  // Reactive hook. Optional.
+    OnApply           func(string, []Statement, []ExecResult)  // Reactive hook. Optional.
 }
 ```
 

@@ -66,9 +66,9 @@ type Config struct {
 	// on every node (leader and followers). Useful for reactive applications
 	// that need to respond to replicated writes (e.g., broadcasting WebSocket
 	// messages when a new row is inserted).
-	// The callback receives the applied statements and their results.
+	// The callback receives the database name, applied statements, and their results.
 	// It is called synchronously in the Raft apply path, so keep it fast.
-	OnApply func(statements []Statement, results []ExecResult)
+	OnApply func(db string, statements []Statement, results []ExecResult)
 }
 
 func (c *Config) validate() error {

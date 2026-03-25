@@ -18,6 +18,7 @@ const (
 // Command is the unit of replication in the Raft log.
 type Command struct {
 	Type       CommandType `json:"type"`
+	DB         string      `json:"db"`
 	Statements []Statement `json:"stmts"`
 }
 

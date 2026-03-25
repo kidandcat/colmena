@@ -11,48 +11,42 @@ import (
 	"sync"
 )
 
-// colmenaConnector implements driver.Connector, used with sql.OpenDB.
 type colmenaConnector struct {
-	node *Node
+	node        *Node
+	dbName      string
+	consistency ConsistencyLevel
 }
 
 func (c *colmenaConnector) Connect(ctx context.Context) (driver.Conn, error) {
-	return &colmenaConn{node: c.node}, nil
+	return &colmenaConn{node: c.node, dbName: c.dbName, consistency: c.consistency}, nil
 }
 
-func (c *colmenaConnector) Driver() driver.Driver {
-	return &colmenaDriver{}
-}
+func (c *colmenaConnector) Driver() driver.Driver { return &colmenaDriver{} }
 
-// colmenaDriver satisfies driver.Driver but is only used via Connector.
 type colmenaDriver struct{}
 
 func (d *colmenaDriver) Open(name string) (driver.Conn, error) {
-	return nil, errors.New("colmena: use sql.OpenDB with Node.DB() instead of sql.Open")
+	return nil, errors.New("colmena: use Node.DB() or Node.OpenDB() instead of sql.Open")
 }
 
-// colmenaConn implements the database/sql driver.Conn interface.
 type colmenaConn struct {
-	node     *Node
-	closed   bool
-	activeTx *colmenaTx // non-nil when in a transaction
+	node        *Node
+	dbName      string
+	consistency ConsistencyLevel
+	closed      bool
+	activeTx    *colmenaTx
 }
 
 func (c *colmenaConn) Prepare(query string) (driver.Stmt, error) {
 	return &colmenaStmt{conn: c, query: query}, nil
 }
 
-func (c *colmenaConn) Close() error {
-	c.closed = true
-	return nil
-}
+func (c *colmenaConn) Close() error { c.closed = true; return nil }
 
 func (c *colmenaConn) Begin() (driver.Tx, error) {
 	return c.BeginTx(context.Background(), driver.TxOptions{})
 }
 
-// BeginTx starts a buffered transaction. Writes are collected and applied
-// atomically through Raft on Commit.
 func (c *colmenaConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
 	if opts.ReadOnly {
 		return nil, errors.New("colmena: read-only transactions not supported")
@@ -62,11 +56,9 @@ func (c *colmenaConn) BeginTx(ctx context.Context, opts driver.TxOptions) (drive
 	return tx, nil
 }
 
-// ExecContext implements driver.ExecerContext for direct exec without Prepare.
 func (c *colmenaConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
-	iArgs := namedToInterface(args)
+	iArgs := namedToAny(args)
 
-	// If inside a transaction, buffer the statement.
 	if c.activeTx != nil {
 		c.activeTx.mu.Lock()
 		c.activeTx.stmts = append(c.activeTx.stmts, Statement{SQL: query, Args: iArgs})
@@ -76,9 +68,9 @@ func (c *colmenaConn) ExecContext(ctx context.Context, query string, args []driv
 
 	cmd := &Command{
 		Type:       CommandExecute,
+		DB:         c.dbName,
 		Statements: []Statement{{SQL: query, Args: iArgs}},
 	}
-
 	result, err := c.node.execute(cmd)
 	if err != nil {
 		return nil, err
@@ -89,33 +81,19 @@ func (c *colmenaConn) ExecContext(ctx context.Context, query string, args []driv
 	return &execResult{r: result.Results[0]}, nil
 }
 
-// QueryContext implements driver.QueryerContext for direct query without Prepare.
 func (c *colmenaConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	consistency := consistencyFromContext(ctx, c.node.config.Consistency)
+	consistency := consistencyFromContext(ctx, c.consistency)
 	iArgs := namedToAny(args)
 
 	switch consistency {
 	case ConsistencyNone:
-		// Read from local SQLite, no checks. Fastest, but may return
-		// stale data if this node is partitioned from the cluster.
 		return c.localQuery(query, iArgs)
-
 	case ConsistencyWeak:
-		// If this node believes it's the leader, read locally (the leader
-		// always has the freshest data). If not, forward to the leader.
-		// Small staleness window: a just-deposed leader may still serve
-		// reads for up to one heartbeat timeout (~1s) before realizing
-		// it lost leadership.
 		if c.node.IsLeader() {
 			return c.localQuery(query, iArgs)
 		}
 		return c.leaderQuery(query, iArgs)
-
 	case ConsistencyStrong:
-		// Linearizable read. The leader confirms it still holds leadership
-		// by contacting a quorum before reading. If this node is not the
-		// leader, the query is forwarded. Guarantees you read the latest
-		// committed state — no staleness possible.
 		if c.node.IsLeader() {
 			if err := c.node.verifyLeader(); err != nil {
 				return nil, fmt.Errorf("colmena: leader verification failed: %w", err)
@@ -123,14 +101,17 @@ func (c *colmenaConn) QueryContext(ctx context.Context, query string, args []dri
 			return c.localQuery(query, iArgs)
 		}
 		return c.leaderQuery(query, iArgs)
-
 	default:
 		return c.localQuery(query, iArgs)
 	}
 }
 
 func (c *colmenaConn) localQuery(query string, args []any) (driver.Rows, error) {
-	rows, err := c.node.store.query(query, args...)
+	st, err := c.node.stores.get(c.dbName)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := st.query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -138,20 +119,15 @@ func (c *colmenaConn) localQuery(query string, args []any) (driver.Rows, error) 
 }
 
 func (c *colmenaConn) leaderQuery(query string, args []any) (driver.Rows, error) {
-	resp, err := c.node.forwardQuery(query, args)
+	resp, err := c.node.forwardQuery(c.dbName, query, args)
 	if err != nil {
 		return nil, err
 	}
-	return &rpcRows{
-		columns: resp.Columns,
-		data:    resp.Rows,
-		pos:     0,
-	}, nil
+	return &rpcRows{columns: resp.Columns, data: resp.Rows}, nil
 }
 
 // --- Transaction ---
 
-// colmenaTx buffers writes and applies them atomically on Commit.
 type colmenaTx struct {
 	conn  *colmenaConn
 	stmts []Statement
@@ -162,21 +138,15 @@ type colmenaTx struct {
 func (tx *colmenaTx) Commit() error {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
-
 	if tx.done {
 		return errors.New("colmena: transaction already completed")
 	}
 	tx.done = true
 	tx.conn.activeTx = nil
-
 	if len(tx.stmts) == 0 {
 		return nil
 	}
-
-	cmd := &Command{
-		Type:       CommandExecuteMulti,
-		Statements: tx.stmts,
-	}
+	cmd := &Command{Type: CommandExecuteMulti, DB: tx.conn.dbName, Statements: tx.stmts}
 	_, err := tx.conn.node.execute(cmd)
 	return err
 }
@@ -184,7 +154,6 @@ func (tx *colmenaTx) Commit() error {
 func (tx *colmenaTx) Rollback() error {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
-
 	if tx.done {
 		return errors.New("colmena: transaction already completed")
 	}
@@ -201,32 +170,26 @@ type colmenaStmt struct {
 	query string
 }
 
-func (s *colmenaStmt) Close() error { return nil }
-
-func (s *colmenaStmt) NumInput() int { return -1 } // unknown
+func (s *colmenaStmt) Close() error  { return nil }
+func (s *colmenaStmt) NumInput() int { return -1 }
 
 func (s *colmenaStmt) Exec(args []driver.Value) (driver.Result, error) {
-	named := valuesToNamed(args)
-	return s.conn.ExecContext(context.Background(), s.query, named)
+	return s.conn.ExecContext(context.Background(), s.query, valuesToNamed(args))
 }
 
 func (s *colmenaStmt) Query(args []driver.Value) (driver.Rows, error) {
-	named := valuesToNamed(args)
-	return s.conn.QueryContext(context.Background(), s.query, named)
+	return s.conn.QueryContext(context.Background(), s.query, valuesToNamed(args))
 }
 
 // --- Result ---
 
-type execResult struct {
-	r ExecResult
-}
+type execResult struct{ r ExecResult }
 
 func (r *execResult) LastInsertId() (int64, error) { return r.r.LastInsertID, nil }
 func (r *execResult) RowsAffected() (int64, error) { return r.r.RowsAffected, nil }
 
-// --- Rows wrappers ---
+// --- Rows ---
 
-// wrappedRows wraps sql.Rows to implement driver.Rows.
 type wrappedRows struct {
 	sqlRows *sql.Rows
 	cols    []string
@@ -242,8 +205,7 @@ func newWrappedRows(rows *sql.Rows) (*wrappedRows, error) {
 }
 
 func (r *wrappedRows) Columns() []string { return r.cols }
-
-func (r *wrappedRows) Close() error { return r.sqlRows.Close() }
+func (r *wrappedRows) Close() error      { return r.sqlRows.Close() }
 
 func (r *wrappedRows) Next(dest []driver.Value) error {
 	if !r.sqlRows.Next() {
@@ -252,10 +214,6 @@ func (r *wrappedRows) Next(dest []driver.Value) error {
 		}
 		return io.EOF
 	}
-	// Scan into []any intermediaries instead of *driver.Value directly.
-	// The database/sql convertAssign function does not support scanning nil
-	// (NULL) into *driver.Value, so we use plain *interface{} targets and
-	// copy the results back into dest afterwards.
 	holders := make([]any, len(dest))
 	scanArgs := make([]any, len(dest))
 	for i := range holders {
@@ -270,7 +228,6 @@ func (r *wrappedRows) Next(dest []driver.Value) error {
 	return nil
 }
 
-// rpcRows wraps RPC query results to implement driver.Rows.
 type rpcRows struct {
 	columns []string
 	data    [][]json.RawMessage
@@ -278,8 +235,7 @@ type rpcRows struct {
 }
 
 func (r *rpcRows) Columns() []string { return r.columns }
-
-func (r *rpcRows) Close() error { return nil }
+func (r *rpcRows) Close() error      { return nil }
 
 func (r *rpcRows) Next(dest []driver.Value) error {
 	if r.pos >= len(r.data) {
@@ -296,14 +252,6 @@ func (r *rpcRows) Next(dest []driver.Value) error {
 }
 
 // --- Helpers ---
-
-func namedToInterface(args []driver.NamedValue) []any {
-	result := make([]any, len(args))
-	for i, a := range args {
-		result[i] = a.Value
-	}
-	return result
-}
 
 func namedToAny(args []driver.NamedValue) []any {
 	result := make([]any, len(args))

@@ -250,7 +250,7 @@ func Restore(ctx context.Context, backend BackupBackend, dataDir string) error {
 	}
 
 	latest := generations[0]
-	dbPath := fmt.Sprintf("%s/%s", dataDir, dbFileName)
+	dbPath := fmt.Sprintf("%s/%s", dataDir, "default.db")
 	walPath := dbPath + "-wal"
 
 	// Remove any existing database files.

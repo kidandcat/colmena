@@ -515,7 +515,7 @@ func TestBackup_LocalBackendSnapshotAndRestore(t *testing.T) {
 	}
 
 	// Verify restored database has the data.
-	restoredDBPath := filepath.Join(restoreDir, dbFileName)
+	restoredDBPath := filepath.Join(restoreDir, "default.db")
 	restoredDB, err := sql.Open("sqlite", fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)", restoredDBPath))
 	if err != nil {
 		t.Fatalf("open restored db: %v", err)
@@ -627,5 +627,155 @@ func TestNode_ClusterInfo(t *testing.T) {
 	}
 	if string(servers[0].ID) != node.NodeID() {
 		t.Fatalf("expected node ID %q, got %q", node.NodeID(), servers[0].ID)
+	}
+}
+
+// --- Multi-Database Tests ---
+
+func TestMultiDB_DifferentConsistency(t *testing.T) {
+	node := testNode(t)
+
+	// Open two databases with different consistency levels.
+	mainDB := node.OpenDB("main", ConsistencyWeak)
+	logsDB := node.OpenDB("logs", ConsistencyNone)
+
+	// Create tables in each database.
+	_, err := mainDB.Exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+	if err != nil {
+		t.Fatalf("create users table: %v", err)
+	}
+	_, err = logsDB.Exec("CREATE TABLE events (id INTEGER PRIMARY KEY, msg TEXT)")
+	if err != nil {
+		t.Fatalf("create events table: %v", err)
+	}
+
+	// Insert into each.
+	_, err = mainDB.Exec("INSERT INTO users (name) VALUES (?)", "alice")
+	if err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	_, err = logsDB.Exec("INSERT INTO events (msg) VALUES (?)", "login")
+	if err != nil {
+		t.Fatalf("insert event: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify data is isolated: users only in mainDB, events only in logsDB.
+	var name string
+	err = mainDB.QueryRow("SELECT name FROM users WHERE id = 1").Scan(&name)
+	if err != nil {
+		t.Fatalf("select user: %v", err)
+	}
+	if name != "alice" {
+		t.Fatalf("expected 'alice', got %q", name)
+	}
+
+	var msg string
+	err = logsDB.QueryRow("SELECT msg FROM events WHERE id = 1").Scan(&msg)
+	if err != nil {
+		t.Fatalf("select event: %v", err)
+	}
+	if msg != "login" {
+		t.Fatalf("expected 'login', got %q", msg)
+	}
+
+	// Verify tables do NOT exist across databases.
+	var count int
+	err = mainDB.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='events'").Scan(&count)
+	if err != nil {
+		t.Fatalf("check events in mainDB: %v", err)
+	}
+	if count != 0 {
+		t.Fatal("events table should not exist in mainDB")
+	}
+
+	err = logsDB.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='users'").Scan(&count)
+	if err != nil {
+		t.Fatalf("check users in logsDB: %v", err)
+	}
+	if count != 0 {
+		t.Fatal("users table should not exist in logsDB")
+	}
+
+	// Verify node.DB() still works (backward compatibility).
+	defaultDB := node.DB()
+	_, err = defaultDB.Exec("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)")
+	if err != nil {
+		t.Fatalf("create kv table on default: %v", err)
+	}
+	_, err = defaultDB.Exec("INSERT INTO kv (key, value) VALUES (?, ?)", "test", "ok")
+	if err != nil {
+		t.Fatalf("insert kv on default: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	var val string
+	err = defaultDB.QueryRow("SELECT value FROM kv WHERE key = ?", "test").Scan(&val)
+	if err != nil {
+		t.Fatalf("select kv from default: %v", err)
+	}
+	if val != "ok" {
+		t.Fatalf("expected 'ok', got %q", val)
+	}
+}
+
+func TestMultiDB_ThreeNodeReplication(t *testing.T) {
+	// Bootstrap leader.
+	leader := testNode(t)
+	leaderAddr := leader.config.Bind
+	time.Sleep(500 * time.Millisecond)
+
+	// Join a follower.
+	follower := testJoinNode(t, leaderAddr)
+	time.Sleep(1 * time.Second)
+
+	// Write to two different databases on the leader.
+	mainDB := leader.OpenDB("main", ConsistencyWeak)
+	logsDB := leader.OpenDB("logs", ConsistencyNone)
+
+	_, err := mainDB.Exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+	if err != nil {
+		t.Fatalf("create users: %v", err)
+	}
+	_, err = logsDB.Exec("CREATE TABLE events (id INTEGER PRIMARY KEY, msg TEXT)")
+	if err != nil {
+		t.Fatalf("create events: %v", err)
+	}
+	_, err = mainDB.Exec("INSERT INTO users (name) VALUES (?)", "bob")
+	if err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	_, err = logsDB.Exec("INSERT INTO events (msg) VALUES (?)", "signup")
+	if err != nil {
+		t.Fatalf("insert event: %v", err)
+	}
+
+	// Wait for replication.
+	time.Sleep(500 * time.Millisecond)
+
+	// Read from follower using ConsistencyNone (local reads).
+	fMainDB := follower.OpenDB("main", ConsistencyNone)
+	fLogsDB := follower.OpenDB("logs", ConsistencyNone)
+
+	ctx := WithConsistency(context.Background(), ConsistencyNone)
+
+	var name string
+	err = fMainDB.QueryRowContext(ctx, "SELECT name FROM users WHERE id = 1").Scan(&name)
+	if err != nil {
+		t.Fatalf("follower read user: %v", err)
+	}
+	if name != "bob" {
+		t.Fatalf("expected 'bob', got %q", name)
+	}
+
+	var msg string
+	err = fLogsDB.QueryRowContext(ctx, "SELECT msg FROM events WHERE id = 1").Scan(&msg)
+	if err != nil {
+		t.Fatalf("follower read event: %v", err)
+	}
+	if msg != "signup" {
+		t.Fatalf("expected 'signup', got %q", msg)
 	}
 }

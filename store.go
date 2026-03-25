@@ -1,11 +1,14 @@
 package colmena
 
 import (
+	"archive/tar"
+	"bytes"
 	"database/sql"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	_ "modernc.org/sqlite"
@@ -23,7 +26,10 @@ type store struct {
 }
 
 func newStore(dataDir string, readConns int) (*store, error) {
-	dbPath := filepath.Join(dataDir, dbFileName)
+	return newStoreAt(filepath.Join(dataDir, dbFileName), readConns)
+}
+
+func newStoreAt(dbPath string, readConns int) (*store, error) {
 
 	// Writer: single connection, WAL mode, immediate transactions.
 	writerDSN := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_txlock=immediate", dbPath)
@@ -161,8 +167,7 @@ func (s *store) restore(r io.Reader) error {
 	os.Remove(s.dbPath + "-shm")
 
 	// Re-open connections with the same readConns as original.
-	dataDir := filepath.Dir(s.dbPath)
-	ns, err := newStore(dataDir, s.readConns)
+	ns, err := newStoreAt(s.dbPath, s.readConns)
 	if err != nil {
 		return fmt.Errorf("colmena: restore reopen: %w", err)
 	}
@@ -182,4 +187,165 @@ func (s *store) close() error {
 		firstErr = err
 	}
 	return firstErr
+}
+
+// storeManager manages multiple named SQLite stores sharing one Raft cluster.
+type storeManager struct {
+	mu        sync.RWMutex
+	stores    map[string]*store
+	dataDir   string
+	readConns int
+}
+
+func newStoreManager(dataDir string, readConns int) *storeManager {
+	return &storeManager{
+		stores:    make(map[string]*store),
+		dataDir:   dataDir,
+		readConns: readConns,
+	}
+}
+
+// get returns the named store, creating it if it does not already exist.
+// The SQLite file for database "foo" lives at dataDir/foo.db.
+func (sm *storeManager) get(name string) (*store, error) {
+	sm.mu.RLock()
+	if s, ok := sm.stores[name]; ok {
+		sm.mu.RUnlock()
+		return s, nil
+	}
+	sm.mu.RUnlock()
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	// Double-check after acquiring write lock.
+	if s, ok := sm.stores[name]; ok {
+		return s, nil
+	}
+
+	dbPath := filepath.Join(sm.dataDir, name+".db")
+	s, err := newStoreAt(dbPath, sm.readConns)
+	if err != nil {
+		return nil, fmt.Errorf("colmena: open store %q: %w", name, err)
+	}
+	sm.stores[name] = s
+	return s, nil
+}
+
+// snapshot writes a tar archive containing all database files to w.
+// Each entry is named "<dbname>.db".
+func (sm *storeManager) snapshot(w io.Writer) error {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	tw := tar.NewWriter(w)
+
+	for name, st := range sm.stores {
+		var buf bytes.Buffer
+		if err := st.snapshot(&buf); err != nil {
+			tw.Close()
+			return fmt.Errorf("colmena: snapshot store %q: %w", name, err)
+		}
+		data := buf.Bytes()
+		hdr := &tar.Header{
+			Name: name + ".db",
+			Size: int64(len(data)),
+			Mode: 0644,
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			tw.Close()
+			return fmt.Errorf("colmena: tar header %q: %w", name, err)
+		}
+		if _, err := tw.Write(data); err != nil {
+			tw.Close()
+			return fmt.Errorf("colmena: tar write %q: %w", name, err)
+		}
+	}
+	return tw.Close()
+}
+
+// restore closes all stores, extracts a tar archive of database files, and
+// reopens the stores.
+func (sm *storeManager) restore(r io.Reader) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	// Close all existing stores.
+	for _, st := range sm.stores {
+		st.close()
+	}
+	sm.stores = make(map[string]*store)
+
+	// Extract tar entries.
+	tr := tar.NewReader(r)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("colmena: tar read: %w", err)
+		}
+
+		// Entry name is "foo.db", derive the db name.
+		name := strings.TrimSuffix(hdr.Name, ".db")
+		dbPath := filepath.Join(sm.dataDir, hdr.Name)
+
+		// Remove leftover WAL/SHM files.
+		os.Remove(dbPath + "-wal")
+		os.Remove(dbPath + "-shm")
+
+		f, err := os.Create(dbPath)
+		if err != nil {
+			return fmt.Errorf("colmena: restore create %q: %w", name, err)
+		}
+		if _, err := io.Copy(f, tr); err != nil {
+			f.Close()
+			return fmt.Errorf("colmena: restore write %q: %w", name, err)
+		}
+		f.Close()
+	}
+
+	// Reopen all database files found in the data directory.
+	entries, err := os.ReadDir(sm.dataDir)
+	if err != nil {
+		return fmt.Errorf("colmena: readdir after restore: %w", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".db") {
+			continue
+		}
+		// Skip raft.db and any non-colmena files.
+		if e.Name() == "raft.db" {
+			continue
+		}
+		name := strings.TrimSuffix(e.Name(), ".db")
+		dbPath := filepath.Join(sm.dataDir, e.Name())
+		s, err := newStoreAt(dbPath, sm.readConns)
+		if err != nil {
+			return fmt.Errorf("colmena: restore reopen %q: %w", name, err)
+		}
+		sm.stores[name] = s
+	}
+
+	return nil
+}
+
+// close closes all managed stores.
+func (sm *storeManager) close() error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	var firstErr error
+	for _, st := range sm.stores {
+		if err := st.close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// defaultStore returns the store named "default", creating it if needed.
+// This preserves backward compatibility.
+func (sm *storeManager) defaultStore() (*store, error) {
+	return sm.get("default")
 }

@@ -11,8 +11,8 @@ import (
 
 // fsm implements the raft.FSM interface, applying replicated commands to the local SQLite store.
 type fsm struct {
-	store   *store
-	onApply func(statements []Statement, results []ExecResult)
+	stores  *storeManager
+	onApply func(db string, statements []Statement, results []ExecResult)
 }
 
 // Apply is called by Raft when a log entry is committed by a quorum.
@@ -24,6 +24,16 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 		return &ApplyResult{Error: err.Error()}
 	}
 
+	dbName := cmd.DB
+	if dbName == "" {
+		dbName = "default"
+	}
+
+	st, err := f.stores.get(dbName)
+	if err != nil {
+		return &ApplyResult{Error: err.Error()}
+	}
+
 	var applyResult *ApplyResult
 
 	switch cmd.Type {
@@ -31,14 +41,14 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 		if len(cmd.Statements) != 1 {
 			return &ApplyResult{Error: "execute command must have exactly 1 statement"}
 		}
-		result, err := f.store.execute(cmd.Statements[0])
+		result, err := st.execute(cmd.Statements[0])
 		if err != nil {
 			return &ApplyResult{Error: err.Error()}
 		}
 		applyResult = &ApplyResult{Results: []ExecResult{result}}
 
 	case CommandExecuteMulti:
-		results, err := f.store.executeMulti(cmd.Statements)
+		results, err := st.executeMulti(cmd.Statements)
 		if err != nil {
 			return &ApplyResult{Error: err.Error()}
 		}
@@ -50,7 +60,7 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 
 	// Fire OnApply callback if set and command succeeded.
 	if f.onApply != nil && applyResult.Error == "" {
-		f.onApply(cmd.Statements, applyResult.Results)
+		f.onApply(dbName, cmd.Statements, applyResult.Results)
 	}
 
 	return applyResult
@@ -58,22 +68,22 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 
 // Snapshot returns an FSM snapshot for Raft log compaction.
 func (f *fsm) Snapshot() (raft.FSMSnapshot, error) {
-	return &fsmSnapshot{store: f.store}, nil
+	return &fsmSnapshot{stores: f.stores}, nil
 }
 
-// Restore replaces the local database with the contents of a snapshot.
+// Restore replaces all local databases with the contents of a snapshot.
 func (f *fsm) Restore(rc io.ReadCloser) error {
 	defer rc.Close()
-	return f.store.restore(rc)
+	return f.stores.restore(rc)
 }
 
-// fsmSnapshot implements raft.FSMSnapshot using SQLite's VACUUM INTO.
+// fsmSnapshot implements raft.FSMSnapshot using a tar archive of all stores.
 type fsmSnapshot struct {
-	store *store
+	stores *storeManager
 }
 
 func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
-	if err := s.store.snapshot(sink); err != nil {
+	if err := s.stores.snapshot(sink); err != nil {
 		sink.Cancel()
 		return err
 	}
@@ -97,6 +107,7 @@ type RPCExecuteResponse struct {
 
 // RPCQueryRequest is sent from a follower to the leader for strong-consistency reads.
 type RPCQueryRequest struct {
+	DB   string
 	SQL  string
 	Args []interface{}
 }

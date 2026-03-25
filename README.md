@@ -85,16 +85,34 @@ All three nodes can serve reads. Writes from any node are automatically forwarde
 
 ## Read Consistency
 
-Control how reads are served using context:
+Colmena has three read consistency levels. The default is **Weak**.
+
+| Level | Where it reads | Guarantee | Latency |
+|---|---|---|---|
+| **None** | Local SQLite on this node | May be stale if node is behind on replication or partitioned | ~8µs |
+| **Weak** | Leader node (forwards if not leader) | Always reads from the node that processes writes. Tiny staleness window (~1s) during leadership transitions | ~90µs |
+| **Strong** | Leader node after quorum confirmation | Linearizable — impossible to get stale data, even during leader changes | ~100µs+ |
+
+How each level works on a **follower** node:
+
+- **None** → reads local SQLite directly (follower's copy, may lag behind leader)
+- **Weak** → forwards the query to the leader via RPC, leader reads its local SQLite
+- **Strong** → forwards to leader, leader contacts quorum to confirm it's still leader, then reads
+
+How each level works on the **leader** node:
+
+- **None** → reads local SQLite directly
+- **Weak** → reads local SQLite directly (it believes it's the leader)
+- **Strong** → confirms leadership with quorum first, then reads local SQLite
 
 ```go
-// Local read (fastest, may be stale if node is partitioned)
+// Read from local SQLite, no network. Fast but may be stale on followers.
 ctx := colmena.WithConsistency(ctx, colmena.ConsistencyNone)
 
-// Weak read (default — checks this node believes it's leader)
+// Read from the leader. Fresh data, minimal overhead. (default)
 ctx := colmena.WithConsistency(ctx, colmena.ConsistencyWeak)
 
-// Strong read (verifies leadership with quorum before reading)
+// Linearizable read. Leader verifies with quorum before responding.
 ctx := colmena.WithConsistency(ctx, colmena.ConsistencyStrong)
 
 rows, err := db.QueryRowContext(ctx, "SELECT ...")

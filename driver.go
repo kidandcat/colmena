@@ -96,26 +96,32 @@ func (c *colmenaConn) QueryContext(ctx context.Context, query string, args []dri
 
 	switch consistency {
 	case ConsistencyNone:
-		// Read directly from local SQLite.
+		// Read from local SQLite, no checks. Fastest, but may return
+		// stale data if this node is partitioned from the cluster.
 		return c.localQuery(query, iArgs)
 
 	case ConsistencyWeak:
-		// Check if we believe we're the leader, then read locally.
+		// If this node believes it's the leader, read locally (the leader
+		// always has the freshest data). If not, forward to the leader.
+		// Small staleness window: a just-deposed leader may still serve
+		// reads for up to one heartbeat timeout (~1s) before realizing
+		// it lost leadership.
 		if c.node.IsLeader() {
 			return c.localQuery(query, iArgs)
 		}
-		// Not leader: read locally anyway (weak = best effort).
-		return c.localQuery(query, iArgs)
+		return c.leaderQuery(query, iArgs)
 
 	case ConsistencyStrong:
+		// Linearizable read. The leader confirms it still holds leadership
+		// by contacting a quorum before reading. If this node is not the
+		// leader, the query is forwarded. Guarantees you read the latest
+		// committed state — no staleness possible.
 		if c.node.IsLeader() {
-			// Verify we're still the leader with a quorum check.
 			if err := c.node.verifyLeader(); err != nil {
 				return nil, fmt.Errorf("colmena: leader verification failed: %w", err)
 			}
 			return c.localQuery(query, iArgs)
 		}
-		// Forward to leader.
 		return c.leaderQuery(query, iArgs)
 
 	default:

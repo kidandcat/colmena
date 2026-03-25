@@ -101,7 +101,7 @@ func (c *Config) applyDefaults() {
 		c.SnapshotInterval = 2 * time.Minute
 	}
 	if c.SnapshotThreshold == 0 {
-		c.SnapshotThreshold = 8192
+		c.SnapshotThreshold = 1024
 	}
 	if c.ApplyTimeout == 0 {
 		c.ApplyTimeout = 10 * time.Second

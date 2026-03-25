@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 
 	_ "modernc.org/sqlite"
 )
@@ -14,9 +15,11 @@ const dbFileName = "colmena.db"
 
 // store manages the local SQLite database with separate writer and reader pools.
 type store struct {
-	dbPath string
-	writer *sql.DB
-	reader *sql.DB
+	dbPath    string
+	writer    *sql.DB
+	reader    *sql.DB
+	readConns int
+	mu        sync.RWMutex // protects writer/reader during restore
 }
 
 func newStore(dataDir string, readConns int) (*store, error) {
@@ -51,14 +54,17 @@ func newStore(dataDir string, readConns int) (*store, error) {
 	reader.SetMaxOpenConns(readConns)
 
 	return &store{
-		dbPath: dbPath,
-		writer: writer,
-		reader: reader,
+		dbPath:    dbPath,
+		writer:    writer,
+		reader:    reader,
+		readConns: readConns,
 	}, nil
 }
 
 // execute runs a write statement on the writer connection.
 func (s *store) execute(stmt Statement) (ExecResult, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	result, err := s.writer.Exec(stmt.SQL, stmt.Args...)
 	if err != nil {
 		return ExecResult{}, err
@@ -70,6 +76,8 @@ func (s *store) execute(stmt Statement) (ExecResult, error) {
 
 // executeMulti runs multiple statements atomically in a single transaction.
 func (s *store) executeMulti(stmts []Statement) ([]ExecResult, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	tx, err := s.writer.Begin()
 	if err != nil {
 		return nil, err
@@ -95,23 +103,24 @@ func (s *store) executeMulti(stmts []Statement) ([]ExecResult, error) {
 
 // query runs a read query on the reader pool.
 func (s *store) query(sqlStr string, args ...any) (*sql.Rows, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.reader.Query(sqlStr, args...)
 }
 
-// snapshot writes a full copy of the database to w using SQLite's backup API.
+// snapshot writes a full copy of the database to w using SQLite's VACUUM INTO.
+// VACUUM INTO creates a standalone, consistent copy of the database without
+// needing a transaction (it is not allowed inside a transaction).
 func (s *store) snapshot(w io.Writer) error {
-	// Use a read transaction to get a consistent snapshot.
-	tx, err := s.reader.Begin()
-	if err != nil {
-		return fmt.Errorf("colmena: snapshot begin: %w", err)
-	}
-	defer tx.Rollback()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-	// VACUUM INTO creates a consistent copy without the WAL.
 	tmpPath := s.dbPath + ".snapshot"
 	defer os.Remove(tmpPath)
 
-	if _, err := tx.Exec(fmt.Sprintf("VACUUM INTO '%s'", tmpPath)); err != nil {
+	// VACUUM INTO creates a consistent, standalone copy of the database.
+	// It must NOT be called inside a transaction.
+	if _, err := s.reader.Exec(fmt.Sprintf("VACUUM INTO '%s'", tmpPath)); err != nil {
 		return fmt.Errorf("colmena: snapshot vacuum: %w", err)
 	}
 
@@ -129,6 +138,9 @@ func (s *store) snapshot(w io.Writer) error {
 
 // restore replaces the database with data from r.
 func (s *store) restore(r io.Reader) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	// Close existing connections.
 	s.writer.Close()
 	s.reader.Close()
@@ -148,18 +160,20 @@ func (s *store) restore(r io.Reader) error {
 	os.Remove(s.dbPath + "-wal")
 	os.Remove(s.dbPath + "-shm")
 
-	// Re-open connections.
+	// Re-open connections with the same readConns as original.
 	dataDir := filepath.Dir(s.dbPath)
-	newStore, err := newStore(dataDir, 0) // readConns will use default
+	ns, err := newStore(dataDir, s.readConns)
 	if err != nil {
 		return fmt.Errorf("colmena: restore reopen: %w", err)
 	}
-	s.writer = newStore.writer
-	s.reader = newStore.reader
+	s.writer = ns.writer
+	s.reader = ns.reader
 	return nil
 }
 
 func (s *store) close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var firstErr error
 	if err := s.reader.Close(); err != nil {
 		firstErr = err

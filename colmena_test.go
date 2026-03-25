@@ -401,6 +401,65 @@ func TestMultiNode_LeaderForwarding(t *testing.T) {
 	}
 }
 
+func TestMultiNode_SnapshotRestore(t *testing.T) {
+	// This test verifies that the FSM snapshot/restore path works correctly.
+	// It forces a Raft snapshot on the leader and then joins a follower which
+	// must receive the snapshot to catch up (since old logs are compacted).
+
+	// Bootstrap leader with very low snapshot threshold.
+	leader := testNode(t, func(cfg *Config) {
+		cfg.SnapshotThreshold = 4
+		cfg.SnapshotInterval = 1 * time.Second
+	})
+	leaderAddr := leader.config.Bind
+	time.Sleep(500 * time.Millisecond)
+
+	// Write enough data to trigger at least one snapshot.
+	db := leader.DB()
+	_, err := db.Exec("CREATE TABLE snap_test (id INTEGER PRIMARY KEY, val TEXT)")
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	for i := 0; i < 20; i++ {
+		_, err = db.Exec("INSERT INTO snap_test (val) VALUES (?)", fmt.Sprintf("row-%d", i))
+		if err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+
+	// Wait for Raft to take a snapshot and compact logs.
+	time.Sleep(3 * time.Second)
+
+	// Verify the leader has data.
+	var count int
+	err = db.QueryRow("SELECT count(*) FROM snap_test").Scan(&count)
+	if err != nil {
+		t.Fatalf("leader count: %v", err)
+	}
+	if count != 20 {
+		t.Fatalf("leader: expected 20 rows, got %d", count)
+	}
+
+	// Now join a follower. Since old logs may be compacted, Raft should send
+	// an InstallSnapshot to bring the follower up to date.
+	follower := testJoinNode(t, leaderAddr)
+
+	// Wait for snapshot transfer and replication.
+	time.Sleep(3 * time.Second)
+
+	// Read from follower.
+	fdb := follower.DB()
+	ctx := WithConsistency(context.Background(), ConsistencyNone)
+	var fCount int
+	err = fdb.QueryRowContext(ctx, "SELECT count(*) FROM snap_test").Scan(&fCount)
+	if err != nil {
+		t.Fatalf("follower count: %v", err)
+	}
+	if fCount != 20 {
+		t.Fatalf("follower: expected 20 rows, got %d", fCount)
+	}
+}
+
 // --- Backup Tests ---
 
 func TestBackup_LocalBackendSnapshotAndRestore(t *testing.T) {

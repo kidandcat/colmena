@@ -1,6 +1,7 @@
 package colmena
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -53,6 +54,24 @@ type Config struct {
 
 	// SQLiteReadConns is the number of SQLite reader connections. Default: 4.
 	SQLiteReadConns int
+
+	// TLSConfig enables mutual TLS on Raft transport and RPC connections.
+	// When set, both Raft inter-node traffic and RPC forwarding are encrypted
+	// and authenticated using the provided TLS configuration. The config must
+	// include a certificate, private key, and CA root pool. When nil (default),
+	// all connections use plaintext TCP as before.
+	TLSConfig *tls.Config
+
+	// BatchWindow is the maximum time to wait before flushing a write batch.
+	// Set to 0 (default) to disable batching and apply each write individually.
+	// Typical values: 1-5ms. Batching amortizes Raft consensus cost across
+	// many statements, yielding 10-100x throughput improvement.
+	BatchWindow time.Duration
+
+	// BatchMaxSize is the maximum number of commands in a single batch.
+	// When reached, the batch is flushed immediately regardless of the window.
+	// Default: 128 (only used when BatchWindow > 0).
+	BatchMaxSize int
 
 	// Backup enables continuous backup when set. The backup engine streams
 	// WAL changes and takes periodic snapshots to the configured backend.
@@ -117,6 +136,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.SQLiteReadConns == 0 {
 		c.SQLiteReadConns = 4
+	}
+	if c.BatchMaxSize == 0 {
+		c.BatchMaxSize = 128
 	}
 	if c.Advertise == "" {
 		c.Advertise = c.Bind

@@ -1,6 +1,10 @@
 package colmena
 
-import "context"
+import (
+	"context"
+	"sync"
+	"time"
+)
 
 // ConsistencyLevel defines the read consistency guarantee.
 type ConsistencyLevel int
@@ -30,6 +34,14 @@ const (
 	// Use for: financial transactions, uniqueness checks, anything where
 	// reading stale data would cause incorrect behavior.
 	ConsistencyStrong
+
+	// ConsistencyLease reads locally while the leader lease is valid,
+	// falling back to ConsistencyWeak (leader forwarding) when the lease
+	// expires. The leader piggybacks a lease timestamp on Raft heartbeats;
+	// followers can serve reads locally as long as the lease hasn't expired.
+	// This gives ~6µs reads with at most LeaseTimeout staleness.
+	// Use for: most applications that want fast reads with bounded staleness.
+	ConsistencyLease
 )
 
 type contextKey int
@@ -50,4 +62,27 @@ func consistencyFromContext(ctx context.Context, defaultLevel ConsistencyLevel) 
 		return v
 	}
 	return defaultLevel
+}
+
+// readLease tracks a time-based lease granted by the Raft leader.
+// While the lease is valid, followers can serve reads locally without
+// an RPC roundtrip to the leader.
+type readLease struct {
+	mu         sync.RWMutex
+	validUntil time.Time
+}
+
+// valid returns true if the lease has not expired.
+func (l *readLease) valid() bool {
+	l.mu.RLock()
+	v := time.Now().Before(l.validUntil)
+	l.mu.RUnlock()
+	return v
+}
+
+// extend sets the lease expiry to now + duration.
+func (l *readLease) extend(d time.Duration) {
+	l.mu.Lock()
+	l.validUntil = time.Now().Add(d)
+	l.mu.Unlock()
 }

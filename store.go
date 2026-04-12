@@ -3,6 +3,7 @@ package colmena
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"database/sql"
 	"fmt"
 	"io"
@@ -13,6 +14,18 @@ import (
 
 	_ "modernc.org/sqlite"
 )
+
+// sqliteBackup is the interface exposed by modernc.org/sqlite's internal conn
+// for the online backup API.
+type sqliteBackup interface {
+	NewBackup(dstUri string) (sqliteBackupHandle, error)
+}
+
+// sqliteBackupHandle represents an in-progress backup.
+type sqliteBackupHandle interface {
+	Step(n int32) (bool, error)
+	Finish() error
+}
 
 const dbFileName = "colmena.db"
 
@@ -114,9 +127,9 @@ func (s *store) query(sqlStr string, args ...any) (*sql.Rows, error) {
 	return s.reader.Query(sqlStr, args...)
 }
 
-// snapshot writes a full copy of the database to w using SQLite's VACUUM INTO.
-// VACUUM INTO creates a standalone, consistent copy of the database without
-// needing a transaction (it is not allowed inside a transaction).
+// snapshot writes a full copy of the database to w using SQLite's Online Backup API.
+// This copies only used pages incrementally, doesn't block concurrent readers,
+// and avoids the temporary disk doubling of VACUUM INTO.
 func (s *store) snapshot(w io.Writer) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -124,10 +137,8 @@ func (s *store) snapshot(w io.Writer) error {
 	tmpPath := s.dbPath + ".snapshot"
 	defer os.Remove(tmpPath)
 
-	// VACUUM INTO creates a consistent, standalone copy of the database.
-	// It must NOT be called inside a transaction.
-	if _, err := s.reader.Exec(fmt.Sprintf("VACUUM INTO '%s'", tmpPath)); err != nil {
-		return fmt.Errorf("colmena: snapshot vacuum: %w", err)
+	if err := s.backupTo(tmpPath); err != nil {
+		return err
 	}
 
 	f, err := os.Open(tmpPath)
@@ -141,6 +152,62 @@ func (s *store) snapshot(w io.Writer) error {
 	}
 	return nil
 }
+
+// backupTo uses the SQLite Online Backup API to create an incremental copy
+// of the database at dstPath. Falls back to VACUUM INTO if the backup API
+// is not accessible (e.g., the driver connection doesn't expose it).
+func (s *store) backupTo(dstPath string) error {
+	conn, err := s.reader.Conn(context.Background())
+	if err != nil {
+		return fmt.Errorf("colmena: get conn for backup: %w", err)
+	}
+	defer conn.Close()
+
+	var backupErr error
+	err = conn.Raw(func(driverConn any) error {
+		bc, ok := driverConn.(sqliteBackup)
+		if !ok {
+			// Driver doesn't expose backup API — fall back to VACUUM INTO.
+			backupErr = errBackupNotSupported
+			return nil
+		}
+
+		dstURI := fmt.Sprintf("file:%s", dstPath)
+		backup, err := bc.NewBackup(dstURI)
+		if err != nil {
+			return fmt.Errorf("colmena: init backup: %w", err)
+		}
+
+		// Copy all pages in one step.
+		for {
+			more, err := backup.Step(-1)
+			if err != nil {
+				backup.Finish()
+				return fmt.Errorf("colmena: backup step: %w", err)
+			}
+			if !more {
+				break
+			}
+		}
+
+		return backup.Finish()
+	})
+
+	if err != nil {
+		return err
+	}
+
+	if backupErr == errBackupNotSupported {
+		// Fallback to VACUUM INTO.
+		if _, err := s.reader.Exec(fmt.Sprintf("VACUUM INTO '%s'", dstPath)); err != nil {
+			return fmt.Errorf("colmena: snapshot vacuum: %w", err)
+		}
+	}
+
+	return nil
+}
+
+var errBackupNotSupported = fmt.Errorf("backup API not supported")
 
 // restore replaces the database with data from r.
 func (s *store) restore(r io.Reader) error {

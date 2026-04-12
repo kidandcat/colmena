@@ -185,8 +185,8 @@ func (b *backupManager) takeSnapshot() error {
 	// Release the read transaction before checkpointing.
 	tx.Rollback()
 
-	// Checkpoint to compact the WAL. TRUNCATE mode resets the WAL file.
-	if _, err := b.store.writer.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+	// PASSIVE checkpoint compacts the WAL without blocking writers.
+	if _, err := b.store.writer.Exec("PRAGMA wal_checkpoint(PASSIVE)"); err != nil {
 		log.Printf("colmena: checkpoint after snapshot (non-fatal): %v", err)
 	}
 

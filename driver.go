@@ -101,6 +101,14 @@ func (c *colmenaConn) QueryContext(ctx context.Context, query string, args []dri
 			return c.localQuery(query, iArgs)
 		}
 		return c.leaderQuery(query, iArgs)
+	case ConsistencyLease:
+		if c.node.IsLeader() {
+			return c.localQuery(query, iArgs)
+		}
+		if c.node.lease.valid() {
+			return c.localQuery(query, iArgs)
+		}
+		return c.leaderQuery(query, iArgs)
 	default:
 		return c.localQuery(query, iArgs)
 	}
@@ -115,6 +123,7 @@ func (c *colmenaConn) localQuery(query string, args []any) (driver.Rows, error) 
 	if err != nil {
 		return nil, err
 	}
+	c.node.metrics.readsTotal.Add(1)
 	return newWrappedRows(rows)
 }
 
@@ -123,6 +132,7 @@ func (c *colmenaConn) leaderQuery(query string, args []any) (driver.Rows, error)
 	if err != nil {
 		return nil, err
 	}
+	c.node.metrics.readsTotal.Add(1)
 	return &rpcRows{columns: resp.Columns, data: resp.Rows}, nil
 }
 

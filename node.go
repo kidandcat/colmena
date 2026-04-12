@@ -1,6 +1,7 @@
 package colmena
 
 import (
+	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -31,9 +32,12 @@ type Node struct {
 
 	rpcServer   *rpc.Server
 	rpcListener net.Listener
-	rpcClients   map[string]*rpc.Client
-	rpcClientsMu sync.Mutex
+	rpcPool     *rpcPool
 
+	batcher  *WriteBatcher
+	lease    *readLease
+	leaseStop chan struct{}
+	metrics  metricsCounters
 	backup   *backupManager
 	dbs      map[string]*sql.DB
 	dbsMu    sync.Mutex
@@ -68,10 +72,27 @@ func New(cfg Config) (*Node, error) {
 		sm.close()
 		return nil, fmt.Errorf("colmena: resolve advertise addr: %w", err)
 	}
-	transport, err := raft.NewTCPTransport(cfg.Bind, advertise, cfg.MaxPool, 10*time.Second, cfg.LogOutput)
-	if err != nil {
-		sm.close()
-		return nil, fmt.Errorf("colmena: create transport: %w", err)
+	var transport raft.Transport
+	if cfg.TLSConfig != nil {
+		serverTLS := cfg.TLSConfig.Clone()
+		serverTLS.ClientAuth = tls.RequireAndVerifyClientCert
+		if serverTLS.ClientCAs == nil {
+			serverTLS.ClientCAs = serverTLS.RootCAs
+		}
+		ln, err := net.Listen("tcp", cfg.Bind)
+		if err != nil {
+			sm.close()
+			return nil, fmt.Errorf("colmena: listen raft: %w", err)
+		}
+		tlsLn := tls.NewListener(ln, serverTLS)
+		layer := &tlsStreamLayer{listener: tlsLn, advertise: advertise, tlsConfig: cfg.TLSConfig}
+		transport = raft.NewNetworkTransport(layer, cfg.MaxPool, 10*time.Second, cfg.LogOutput)
+	} else {
+		transport, err = raft.NewTCPTransport(cfg.Bind, advertise, cfg.MaxPool, 10*time.Second, cfg.LogOutput)
+		if err != nil {
+			sm.close()
+			return nil, fmt.Errorf("colmena: create transport: %w", err)
+		}
 	}
 
 	logStore, err := raftboltdb.New(raftboltdb.Options{Path: filepath.Join(cfg.DataDir, "raft.db")})
@@ -97,7 +118,7 @@ func New(cfg Config) (*Node, error) {
 		stores:     sm,
 		raft:       r,
 		fsm:        f,
-		rpcClients: make(map[string]*rpc.Client),
+		rpcPool:    newRPCPool(cfg.TLSConfig),
 		dbs:        make(map[string]*sql.DB),
 	}
 
@@ -126,6 +147,14 @@ func New(cfg Config) (*Node, error) {
 			return nil, err
 		}
 	}
+
+	if cfg.BatchWindow > 0 {
+		node.batcher = newWriteBatcher(node, cfg.BatchWindow, cfg.BatchMaxSize)
+	}
+
+	node.lease = &readLease{}
+	node.leaseStop = make(chan struct{})
+	go node.leaseLoop()
 
 	if cfg.Backup != nil && cfg.Backup.Backend != nil {
 		defStore, err := sm.get("default")
@@ -175,6 +204,8 @@ func (n *Node) Close() error {
 	n.closedMu.Unlock()
 
 	var firstErr error
+	if n.leaseStop != nil { close(n.leaseStop) }
+	if n.batcher != nil { n.batcher.close() }
 	if n.backup != nil { n.backup.stop() }
 
 	n.dbsMu.Lock()
@@ -184,9 +215,7 @@ func (n *Node) Close() error {
 	n.dbsMu.Unlock()
 
 	if n.rpcListener != nil { n.rpcListener.Close() }
-	n.rpcClientsMu.Lock()
-	for _, c := range n.rpcClients { c.Close() }
-	n.rpcClientsMu.Unlock()
+	if n.rpcPool != nil { n.rpcPool.close() }
 
 	if n.raft != nil {
 		if err := n.raft.Shutdown().Error(); err != nil && firstErr == nil { firstErr = err }
@@ -198,10 +227,31 @@ func (n *Node) Close() error {
 }
 
 func (n *Node) execute(cmd *Command) (*ApplyResult, error) {
-	data, err := marshalCommand(cmd)
-	if err != nil { return nil, err }
-	if n.raft.State() == raft.Leader { return n.applyRaft(data) }
-	return n.forwardExecute(data)
+	var result *ApplyResult
+	var err error
+	if n.raft.State() == raft.Leader {
+		if n.batcher != nil {
+			result, err = n.batcher.submit(cmd)
+		} else {
+			var data []byte
+			data, err = marshalCommand(cmd)
+			if err != nil {
+				return nil, err
+			}
+			result, err = n.applyRaft(data)
+		}
+	} else {
+		var data []byte
+		data, err = marshalCommand(cmd)
+		if err != nil {
+			return nil, err
+		}
+		result, err = n.forwardExecute(data)
+	}
+	if err == nil {
+		n.metrics.writesTotal.Add(1)
+	}
+	return result, err
 }
 
 func (n *Node) applyRaft(data []byte) (*ApplyResult, error) {
@@ -220,11 +270,14 @@ func (n *Node) verifyLeader() error { return n.raft.VerifyLeader().Error() }
 func (n *Node) forwardExecute(data []byte) (*ApplyResult, error) {
 	leaderAddr, _ := n.raft.LeaderWithID()
 	if leaderAddr == "" { return nil, ErrNotLeader }
-	client, err := n.getRPCClient(string(leaderAddr))
+	addr := string(leaderAddr)
+	client, err := n.rpcPool.get(addr)
 	if err != nil { return nil, fmt.Errorf("colmena: connect to leader: %w", err) }
+	n.metrics.rpcForwardsTotal.Add(1)
 	req := &RPCExecuteRequest{Command: data}
 	var resp RPCExecuteResponse
 	if err := client.Call("Colmena.Execute", req, &resp); err != nil {
+		n.rpcPool.markFailed(addr)
 		return nil, fmt.Errorf("colmena: forward execute: %w", err)
 	}
 	if resp.Error != "" { return nil, errors.New(resp.Error) }
@@ -234,13 +287,16 @@ func (n *Node) forwardExecute(data []byte) (*ApplyResult, error) {
 func (n *Node) forwardQuery(dbName, sqlStr string, args []any) (*RPCQueryResponse, error) {
 	leaderAddr, _ := n.raft.LeaderWithID()
 	if leaderAddr == "" { return nil, ErrNotLeader }
-	client, err := n.getRPCClient(string(leaderAddr))
+	addr := string(leaderAddr)
+	client, err := n.rpcPool.get(addr)
 	if err != nil { return nil, fmt.Errorf("colmena: connect to leader: %w", err) }
+	n.metrics.rpcForwardsTotal.Add(1)
 	iArgs := make([]any, len(args))
 	copy(iArgs, args)
 	req := &RPCQueryRequest{DB: dbName, SQL: sqlStr, Args: iArgs}
 	var resp RPCQueryResponse
 	if err := client.Call("Colmena.Query", req, &resp); err != nil {
+		n.rpcPool.markFailed(addr)
 		return nil, fmt.Errorf("colmena: forward query: %w", err)
 	}
 	if resp.Error != "" { return nil, errors.New(resp.Error) }
@@ -331,14 +387,18 @@ func (s *RPCService) Join(req *RPCJoinRequest, resp *RPCJoinResponse) error {
 
 func (n *Node) join() error {
 	for _, addr := range n.config.Join {
-		client, err := n.getRPCClient(addr)
+		client, err := n.rpcPool.get(addr)
 		if err != nil { log.Printf("colmena: failed to connect to %s: %v", addr, err); continue }
 		req := &RPCJoinRequest{NodeID: n.config.NodeID, Address: n.config.Advertise}
 		var resp RPCJoinResponse
-		if err := client.Call("Colmena.Join", req, &resp); err != nil { log.Printf("colmena: join RPC to %s failed: %v", addr, err); continue }
+		if err := client.Call("Colmena.Join", req, &resp); err != nil {
+			n.rpcPool.markFailed(addr)
+			log.Printf("colmena: join RPC to %s failed: %v", addr, err)
+			continue
+		}
 		if resp.Error != "" {
 			if resp.LeaderAddr != "" {
-				if c2, err := n.getRPCClient(resp.LeaderAddr); err == nil {
+				if c2, err := n.rpcPool.get(resp.LeaderAddr); err == nil {
 					var r2 RPCJoinResponse
 					if err := c2.Call("Colmena.Join", req, &r2); err == nil && r2.Error == "" { return nil }
 				}
@@ -350,18 +410,6 @@ func (n *Node) join() error {
 	return fmt.Errorf("colmena: failed to join cluster via any address")
 }
 
-func (n *Node) getRPCClient(addr string) (*rpc.Client, error) {
-	n.rpcClientsMu.Lock()
-	defer n.rpcClientsMu.Unlock()
-	if c, ok := n.rpcClients[addr]; ok { return c, nil }
-	rpcAddr, err := rpcAddrFrom(addr)
-	if err != nil { return nil, err }
-	c, err := rpc.Dial("tcp", rpcAddr)
-	if err != nil { return nil, fmt.Errorf("colmena: dial RPC %s: %w", rpcAddr, err) }
-	n.rpcClients[addr] = c
-	return c, nil
-}
-
 func (n *Node) startRPC() error {
 	rpcAddr, err := rpcAddrFrom(n.config.Bind)
 	if err != nil { return err }
@@ -369,7 +417,17 @@ func (n *Node) startRPC() error {
 	if err := n.rpcServer.RegisterName("Colmena", &RPCService{node: n}); err != nil {
 		return fmt.Errorf("colmena: register RPC: %w", err)
 	}
-	ln, err := net.Listen("tcp", rpcAddr)
+	var ln net.Listener
+	if n.config.TLSConfig != nil {
+		serverTLS := n.config.TLSConfig.Clone()
+		serverTLS.ClientAuth = tls.RequireAndVerifyClientCert
+		if serverTLS.ClientCAs == nil {
+			serverTLS.ClientCAs = serverTLS.RootCAs
+		}
+		ln, err = tls.Listen("tcp", rpcAddr, serverTLS)
+	} else {
+		ln, err = net.Listen("tcp", rpcAddr)
+	}
 	if err != nil { return fmt.Errorf("colmena: listen RPC on %s: %w", rpcAddr, err) }
 	n.rpcListener = ln
 	go func() {
@@ -383,5 +441,38 @@ func rpcAddrFrom(raftAddr string) (string, error) {
 	if err != nil { return "", fmt.Errorf("colmena: parse addr %q: %w", raftAddr, err) }
 	var port int
 	fmt.Sscanf(portStr, "%d", &port)
-	return fmt.Sprintf("%s:%d", host, port+1), nil
+	return net.JoinHostPort(host, fmt.Sprintf("%d", port+1)), nil
+}
+
+// leaseLoop periodically checks Raft's last_contact stat and extends the
+// read lease when the leader heartbeat is fresh. On leaders, the lease is
+// always valid. On followers, it tracks leader heartbeat freshness.
+func (n *Node) leaseLoop() {
+	ticker := time.NewTicker(n.config.HeartbeatTimeout / 4)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-n.leaseStop:
+			return
+		case <-ticker.C:
+			if n.raft.State() == raft.Leader {
+				// Leaders always have fresh data.
+				n.lease.extend(n.config.HeartbeatTimeout)
+				continue
+			}
+			stats := n.raft.Stats()
+			lastContact := stats["last_contact"]
+			if lastContact == "never" || lastContact == "0" {
+				continue
+			}
+			d, err := time.ParseDuration(lastContact)
+			if err != nil {
+				continue
+			}
+			// If last contact is within half the heartbeat timeout, extend the lease.
+			if d < n.config.HeartbeatTimeout/2 {
+				n.lease.extend(n.config.HeartbeatTimeout / 2)
+			}
+		}
+	}
 }

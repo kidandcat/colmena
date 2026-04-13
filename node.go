@@ -39,6 +39,7 @@ type Node struct {
 	leaseStop chan struct{}
 	metrics  metricsCounters
 	backup   *backupManager
+	handlers handlerRegistry
 	dbs      map[string]*sql.DB
 	dbsMu    sync.Mutex
 	closed   bool
@@ -119,6 +120,7 @@ func New(cfg Config) (*Node, error) {
 		raft:       r,
 		fsm:        f,
 		rpcPool:    newRPCPool(cfg.TLSConfig),
+		handlers:   handlerRegistry{handlers: make(map[string]func([]byte) ([]byte, error))},
 		dbs:        make(map[string]*sql.DB),
 	}
 
@@ -303,6 +305,23 @@ func (n *Node) forwardQuery(dbName, sqlStr string, args []any) (*RPCQueryRespons
 	return &resp, nil
 }
 
+func (n *Node) forwardHandler(name string, data []byte) ([]byte, error) {
+	leaderAddr, _ := n.raft.LeaderWithID()
+	if leaderAddr == "" { return nil, ErrNotLeader }
+	addr := string(leaderAddr)
+	client, err := n.rpcPool.get(addr)
+	if err != nil { return nil, fmt.Errorf("colmena: connect to leader: %w", err) }
+	n.metrics.rpcForwardsTotal.Add(1)
+	req := &RPCForwardRequest{Handler: name, Payload: data}
+	var resp RPCForwardResponse
+	if err := client.Call("Colmena.Forward", req, &resp); err != nil {
+		n.rpcPool.markFailed(addr)
+		return nil, fmt.Errorf("colmena: forward handler: %w", err)
+	}
+	if resp.Error != "" { return nil, errors.New(resp.Error) }
+	return resp.Payload, nil
+}
+
 func (n *Node) WaitForLeader(timeout time.Duration) error {
 	deadline := time.After(timeout)
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -370,6 +389,14 @@ func (s *RPCService) Query(req *RPCQueryRequest, resp *RPCQueryResponse) error {
 		resp.Rows = append(resp.Rows, rowData)
 	}
 	if err := rows.Err(); err != nil { resp.Error = err.Error() }
+	return nil
+}
+
+func (s *RPCService) Forward(req *RPCForwardRequest, resp *RPCForwardResponse) error {
+	if s.node.raft.State() != raft.Leader { resp.Error = "not the leader"; return nil }
+	data, err := s.node.handlers.call(req.Handler, req.Payload)
+	if err != nil { resp.Error = err.Error(); return nil }
+	resp.Payload = data
 	return nil
 }
 

@@ -41,6 +41,7 @@ db.QueryRow("SELECT value FROM kv WHERE key = ?", "hello").Scan(&value)
 - **Configurable read consistency** — `None` (local), `Weak` (leader check), `Strong` (quorum verify).
 - **Buffered transactions** — `db.Begin()`/`tx.Commit()` batches writes into a single Raft entry.
 - **Continuous backup** — Litestream-style WAL streaming to local filesystem or S3.
+- **Leader forwarding for custom handlers** — type-safe `Forward[Req, Resp]()` sends any request to the leader via RPC.
 - **Reactive hooks** — `OnApply` callback fires on every node after each replicated write.
 
 ## Quick Start
@@ -206,6 +207,37 @@ node, _ := colmena.New(colmena.Config{
 })
 ```
 
+## Leader Forwarding for Custom Handlers
+
+Register typed handlers that always execute on the leader, regardless of which node receives the request. Useful for MQTT command processing, webhook handling, or any logic that must run on a single node.
+
+```go
+// Define a typed key — the type parameters enforce compile-time safety.
+var ProcessCmd = colmena.NewHandlerKey[CommandReq, CommandResp]("device.command")
+
+// Register the handler on every node (same binary, same code).
+colmena.RegisterHandler(node, ProcessCmd, func(req CommandReq) (CommandResp, error) {
+    // This only executes on the leader.
+    result, err := processDeviceCommand(req.DeviceID, req.Payload)
+    if err != nil {
+        return CommandResp{}, err
+    }
+    return CommandResp{Status: "ok", Result: result}, nil
+})
+
+// Forward from any node — routed to the leader automatically.
+resp, err := colmena.Forward(node, ProcessCmd, CommandReq{
+    DeviceID: "sensor-42",
+    Payload:  []byte(`{"action":"reboot"}`),
+})
+```
+
+How it works:
+- If the node **is** the leader, the handler runs locally with no network hop.
+- If the node **is not** the leader, the request is serialized and forwarded to the leader via the existing RPC pool (same connection pool used for SQL forwarding).
+- The `HandlerKey[Req, Resp]` ensures that request and response types match at compile time — no raw strings or `interface{}` at the call site.
+- Handlers must be registered before calling `Forward`. Registering the same key twice panics.
+
 ## Multiple Databases
 
 A single Raft cluster can host multiple independent SQLite databases, each with its own default consistency level. Each database maps to a separate `.db` file on disk.
@@ -277,8 +309,9 @@ colmena.Config{
 
 - **Writes** go through Raft consensus (leader serializes, quorum acknowledges, all nodes apply).
 - **Reads** hit local SQLite directly (configurable consistency level).
+- **Custom handlers** follow the same forwarding path as writes — any node can call `Forward()`, and the request is routed to the leader via RPC.
 - **Snapshots** use `VACUUM INTO` for consistent point-in-time copies.
-- **RPC** uses `net/rpc` on port+1 for leader forwarding and cluster join.
+- **RPC** uses `net/rpc` on port+1 for leader forwarding, handler forwarding, and cluster join.
 
 ## Benchmarks
 

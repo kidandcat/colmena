@@ -1604,3 +1604,144 @@ func TestRPCService_PingDirect(t *testing.T) {
 		t.Fatalf("Ping: %v", err)
 	}
 }
+
+// =============================================================================
+// Handler forwarding tests
+// =============================================================================
+
+func TestHandler_LeaderLocalExecution(t *testing.T) {
+	type PingReq struct{ Msg string }
+	type PingResp struct{ Reply string }
+
+	node := testNode(t)
+
+	key := NewHandlerKey[PingReq, PingResp]("test.ping")
+	RegisterHandler(node, key, func(req PingReq) (PingResp, error) {
+		return PingResp{Reply: "pong: " + req.Msg}, nil
+	})
+
+	resp, err := Forward(node, key, PingReq{Msg: "hello"})
+	if err != nil {
+		t.Fatalf("forward: %v", err)
+	}
+	if resp.Reply != "pong: hello" {
+		t.Fatalf("expected 'pong: hello', got %q", resp.Reply)
+	}
+}
+
+func TestHandler_ErrorPropagation(t *testing.T) {
+	type Req struct{}
+	type Resp struct{}
+
+	node := testNode(t)
+
+	key := NewHandlerKey[Req, Resp]("test.fail")
+	RegisterHandler(node, key, func(req Req) (Resp, error) {
+		return Resp{}, errors.New("handler error")
+	})
+
+	_, err := Forward(node, key, Req{})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "handler error") {
+		t.Fatalf("expected 'handler error', got %q", err)
+	}
+}
+
+func TestHandler_UnknownKey(t *testing.T) {
+	type Req struct{}
+	type Resp struct{}
+
+	node := testNode(t)
+
+	key := NewHandlerKey[Req, Resp]("test.nonexistent")
+	_, err := Forward(node, key, Req{})
+	if err == nil {
+		t.Fatal("expected error for unknown handler")
+	}
+	if !strings.Contains(err.Error(), "unknown handler") {
+		t.Fatalf("expected 'unknown handler', got %q", err)
+	}
+}
+
+func TestHandler_DuplicateRegistrationPanics(t *testing.T) {
+	type Req struct{}
+	type Resp struct{}
+
+	node := testNode(t)
+
+	key := NewHandlerKey[Req, Resp]("test.dup")
+	RegisterHandler(node, key, func(req Req) (Resp, error) { return Resp{}, nil })
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on duplicate registration")
+		}
+		msg := fmt.Sprintf("%v", r)
+		if !strings.Contains(msg, "already registered") {
+			t.Fatalf("unexpected panic: %v", r)
+		}
+	}()
+
+	RegisterHandler(node, key, func(req Req) (Resp, error) { return Resp{}, nil })
+}
+
+func TestHandler_ForwardFromFollower(t *testing.T) {
+	type AddReq struct{ A, B int }
+	type AddResp struct{ Sum int }
+
+	leader := testNode(t)
+	follower := testJoinNode(t, leader.config.Advertise)
+
+	key := NewHandlerKey[AddReq, AddResp]("test.add")
+
+	// Register on both nodes (as you would in a real app).
+	RegisterHandler(leader, key, func(req AddReq) (AddResp, error) {
+		return AddResp{Sum: req.A + req.B}, nil
+	})
+	RegisterHandler(follower, key, func(req AddReq) (AddResp, error) {
+		return AddResp{Sum: req.A + req.B}, nil
+	})
+
+	// Wait for the follower to see the leader.
+	if err := follower.WaitForLeader(5 * time.Second); err != nil {
+		t.Fatalf("follower wait for leader: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	// Forward from follower — should be routed to the leader.
+	resp, err := Forward(follower, key, AddReq{A: 3, B: 7})
+	if err != nil {
+		t.Fatalf("forward from follower: %v", err)
+	}
+	if resp.Sum != 10 {
+		t.Fatalf("expected 10, got %d", resp.Sum)
+	}
+}
+
+func TestHandler_RPCServiceForwardDirect(t *testing.T) {
+	type Req struct{ X int }
+	type Resp struct{ Y int }
+
+	node := testNode(t)
+	svc := &RPCService{node: node}
+
+	key := NewHandlerKey[Req, Resp]("test.double")
+	RegisterHandler(node, key, func(req Req) (Resp, error) {
+		return Resp{Y: req.X * 2}, nil
+	})
+
+	rpcReq := &RPCForwardRequest{Handler: "test.double", Payload: []byte(`{"X":21}`)}
+	var rpcResp RPCForwardResponse
+	if err := svc.Forward(rpcReq, &rpcResp); err != nil {
+		t.Fatalf("RPC Forward: %v", err)
+	}
+	if rpcResp.Error != "" {
+		t.Fatalf("RPC Forward error: %s", rpcResp.Error)
+	}
+	if string(rpcResp.Payload) != `{"Y":42}` {
+		t.Fatalf("expected {\"Y\":42}, got %s", rpcResp.Payload)
+	}
+}

@@ -96,7 +96,10 @@ func New(cfg Config) (*Node, error) {
 		}
 	}
 
-	logStore, err := raftboltdb.New(raftboltdb.Options{Path: filepath.Join(cfg.DataDir, "raft.db")})
+	logStore, err := raftboltdb.New(raftboltdb.Options{
+		Path:   filepath.Join(cfg.DataDir, "raft.db"),
+		NoSync: cfg.UnsafeNoRaftLogFsync,
+	})
 	if err != nil {
 		sm.close()
 		return nil, fmt.Errorf("colmena: create log store: %w", err)
@@ -153,6 +156,7 @@ func New(cfg Config) (*Node, error) {
 	if cfg.BatchWindow > 0 {
 		node.batcher = newWriteBatcher(node, cfg.BatchWindow, cfg.BatchMaxSize)
 	}
+	// Negative BatchWindow disables batching entirely (opt-out escape hatch).
 
 	node.lease = &readLease{}
 	node.leaseStop = make(chan struct{})

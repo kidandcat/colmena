@@ -234,9 +234,94 @@ func TestLatencyDistribution(t *testing.T) {
 	t.Logf("Read throughput (follower local, 8 goroutines): %d ops/sec", readThroughput)
 }
 
+// BenchmarkThreeNode_WriteParallelOnLeader measures write throughput on the
+// leader with the default batch window. Under concurrency, the batcher coalesces
+// writes into a single Raft entry, so throughput scales far beyond what a serial
+// writer achieves (see BenchmarkThreeNode_WriteOnLeader for the serial case).
+func BenchmarkThreeNode_WriteParallelOnLeader(b *testing.B) {
+	leader, _, _ := benchCluster(b)
+	db := leader.DB()
+	db.Exec("CREATE TABLE IF NOT EXISTS bench3p (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")
+	time.Sleep(500 * time.Millisecond)
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			_, err := db.Exec("INSERT INTO bench3p (val) VALUES (?)", fmt.Sprintf("val-%d", i))
+			if err != nil {
+				b.Fatal(err)
+			}
+			i++
+		}
+	})
+}
+
+// TestBatchingThroughput measures sustained write throughput with and without
+// batching, plus across concurrency levels. Run with:
+//
+//	go test -run TestBatchingThroughput -v -timeout 300s .
+func TestBatchingThroughput(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping batching throughput test in short mode")
+	}
+
+	cases := []struct {
+		name        string
+		batchWindow time.Duration
+		goroutines  int
+		noFsync     bool
+	}{
+		{"batching_off_4g", -1, 4, false},
+		{"batching_off_32g", -1, 32, false},
+		{"batching_2ms_4g", 2 * time.Millisecond, 4, false},
+		{"batching_2ms_32g", 2 * time.Millisecond, 32, false},
+		{"batching_2ms_128g", 2 * time.Millisecond, 128, false},
+		{"batching_5ms_128g", 5 * time.Millisecond, 128, false},
+		{"batch2ms_nofsync_128g", 2 * time.Millisecond, 128, true},
+	}
+
+	t.Logf("\n=== Batching Throughput (5s sustained, 3-node cluster) ===")
+	t.Logf("%-24s %12s %12s", "Config", "ops/sec", "goroutines")
+	t.Logf("%-24s %12s %12s", "------", "-------", "----------")
+
+	for _, tc := range cases {
+		func() {
+			opts := []clusterOpt{withBatching(tc.batchWindow)}
+			if tc.noFsync {
+				opts = append(opts, withNoFsync())
+			}
+			leader, _, _ := benchCluster(t, opts...)
+			ldb := leader.DB()
+			ldb.Exec("CREATE TABLE IF NOT EXISTS tp_test (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")
+			time.Sleep(500 * time.Millisecond)
+
+			throughput := measureThroughput(5*time.Second, tc.goroutines, func() error {
+				_, err := ldb.Exec("INSERT INTO tp_test (val) VALUES (?)", "tp")
+				return err
+			})
+			t.Logf("%-24s %12d %12d", tc.name, throughput, tc.goroutines)
+		}()
+	}
+}
+
 // --- Helpers ---
 
-func benchNode(b testing.TB) *Node {
+type clusterOpt func(*Config)
+
+func withBatching(window time.Duration) clusterOpt {
+	return func(c *Config) {
+		c.BatchWindow = window
+	}
+}
+
+func withNoFsync() clusterOpt {
+	return func(c *Config) {
+		c.UnsafeNoRaftLogFsync = true
+	}
+}
+
+func benchNode(b testing.TB, opts ...clusterOpt) *Node {
 	b.Helper()
 	port := freePort(b)
 
@@ -251,6 +336,9 @@ func benchNode(b testing.TB) *Node {
 		ApplyTimeout:      5 * time.Second,
 		LogOutput:         io.Discard,
 	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 
 	node, err := New(cfg)
 	if err != nil {
@@ -263,11 +351,11 @@ func benchNode(b testing.TB) *Node {
 	return node
 }
 
-func benchCluster(t testing.TB) (leader, follower1, follower2 *Node) {
+func benchCluster(t testing.TB, opts ...clusterOpt) (leader, follower1, follower2 *Node) {
 	t.Helper()
 
 	port1 := freePort(t)
-	leader, err := New(Config{
+	leaderCfg := Config{
 		NodeID:            fmt.Sprintf("bench-leader-%d", port1),
 		DataDir:           t.TempDir(),
 		Bind:              fmt.Sprintf("127.0.0.1:%d", port1),
@@ -277,7 +365,11 @@ func benchCluster(t testing.TB) (leader, follower1, follower2 *Node) {
 		SnapshotThreshold: 8192,
 		ApplyTimeout:      5 * time.Second,
 		LogOutput:         io.Discard,
-	})
+	}
+	for _, opt := range opts {
+		opt(&leaderCfg)
+	}
+	leader, err := New(leaderCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,7 +382,7 @@ func benchCluster(t testing.TB) (leader, follower1, follower2 *Node) {
 	leaderAddr := leader.config.Bind
 	mkFollower := func() *Node {
 		p := freePort(t)
-		n, err := New(Config{
+		fcfg := Config{
 			NodeID:           fmt.Sprintf("bench-follower-%d", p),
 			DataDir:          t.TempDir(),
 			Bind:             fmt.Sprintf("127.0.0.1:%d", p),
@@ -299,7 +391,11 @@ func benchCluster(t testing.TB) (leader, follower1, follower2 *Node) {
 			ElectionTimeout:  200 * time.Millisecond,
 			ApplyTimeout:     5 * time.Second,
 			LogOutput:        io.Discard,
-		})
+		}
+		for _, opt := range opts {
+			opt(&fcfg)
+		}
+		n, err := New(fcfg)
 		if err != nil {
 			t.Fatal(err)
 		}

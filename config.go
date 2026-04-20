@@ -63,15 +63,36 @@ type Config struct {
 	TLSConfig *tls.Config
 
 	// BatchWindow is the maximum time to wait before flushing a write batch.
-	// Set to 0 (default) to disable batching and apply each write individually.
-	// Typical values: 1-5ms. Batching amortizes Raft consensus cost across
-	// many statements, yielding 10-100x throughput improvement.
+	// Batching coalesces concurrent writes into a single Raft log entry,
+	// amortizing consensus cost across many statements and yielding 10-100x
+	// throughput improvement under concurrent load.
+	//
+	// Trade-off: a single write with no concurrency waits up to BatchWindow
+	// before being applied (added to P50 latency).
+	//
+	// Default: 2ms. Set to a negative value to disable batching entirely
+	// (each write applied individually); set to 0 to use the default.
 	BatchWindow time.Duration
 
 	// BatchMaxSize is the maximum number of commands in a single batch.
 	// When reached, the batch is flushed immediately regardless of the window.
-	// Default: 128 (only used when BatchWindow > 0).
+	// Default: 128.
 	BatchMaxSize int
+
+	// UnsafeNoRaftLogFsync disables fsync on the Raft log (BoltDB) after
+	// every append. This can multiply write throughput several times because
+	// Raft no longer waits for disk sync before acknowledging quorum, but it
+	// means a sudden power loss or kernel panic can lose the last few
+	// committed entries on an individual node.
+	//
+	// Safe enough in two scenarios:
+	//   1. Clusters of 3+ nodes where losing a single node's tail is tolerable
+	//      — Raft will re-replicate missing entries from peers on restart.
+	//   2. Ephemeral/development clusters where durability isn't required.
+	//
+	// Do NOT enable in production single-node deployments or where the whole
+	// cluster can lose power simultaneously. Default: false.
+	UnsafeNoRaftLogFsync bool
 
 	// Backup enables continuous backup when set. The backup engine streams
 	// WAL changes and takes periodic snapshots to the configured backend.
@@ -136,6 +157,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.SQLiteReadConns == 0 {
 		c.SQLiteReadConns = 4
+	}
+	if c.BatchWindow == 0 {
+		c.BatchWindow = 2 * time.Millisecond
+	} else if c.BatchWindow < 0 {
+		// Negative sentinel means "explicitly disabled".
+		c.BatchWindow = 0
 	}
 	if c.BatchMaxSize == 0 {
 		c.BatchMaxSize = 128

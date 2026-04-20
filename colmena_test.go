@@ -986,7 +986,7 @@ func TestRpcRows(t *testing.T) {
 	}
 	rows := &rpcRows{
 		columns: []string{"name", "num"},
-		data:    [][]json.RawMessage{row1, row2},
+		legacy:  [][]json.RawMessage{row1, row2},
 	}
 
 	if cols := rows.Columns(); len(cols) != 2 || cols[0] != "name" || cols[1] != "num" {
@@ -1406,8 +1406,8 @@ func TestFollower_ForwardQuery(t *testing.T) {
 	if len(resp.Columns) == 0 {
 		t.Fatal("expected columns in response")
 	}
-	if len(resp.Rows) != 1 {
-		t.Fatalf("expected 1 row, got %d", len(resp.Rows))
+	if len(resp.TaggedRows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(resp.TaggedRows))
 	}
 }
 
@@ -1443,8 +1443,8 @@ func TestRPCService_QueryHandler(t *testing.T) {
 	if len(resp.Columns) == 0 {
 		t.Fatal("expected columns")
 	}
-	if len(resp.Rows) != 1 {
-		t.Fatalf("expected 1 row, got %d", len(resp.Rows))
+	if len(resp.TaggedRows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(resp.TaggedRows))
 	}
 }
 
@@ -2219,8 +2219,8 @@ func TestRPCService_QueryMultipleRows(t *testing.T) {
 	if resp.Error != "" {
 		t.Fatalf("query error: %s", resp.Error)
 	}
-	if len(resp.Rows) != 3 {
-		t.Fatalf("expected 3 rows, got %d", len(resp.Rows))
+	if len(resp.TaggedRows) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(resp.TaggedRows))
 	}
 	if len(resp.Columns) != 2 {
 		t.Fatalf("expected 2 columns, got %d", len(resp.Columns))
@@ -2334,8 +2334,8 @@ func TestFollower_WeakQueryWithArgs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("forward query with args: %v", err)
 	}
-	if len(resp.Rows) != 1 {
-		t.Fatalf("expected 1 row, got %d", len(resp.Rows))
+	if len(resp.TaggedRows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(resp.TaggedRows))
 	}
 }
 
@@ -2369,8 +2369,8 @@ func TestRPCService_QueryWithArgs(t *testing.T) {
 	if resp.Error != "" {
 		t.Fatalf("query error: %s", resp.Error)
 	}
-	if len(resp.Rows) != 1 {
-		t.Fatalf("expected 1 row, got %d", len(resp.Rows))
+	if len(resp.TaggedRows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(resp.TaggedRows))
 	}
 }
 

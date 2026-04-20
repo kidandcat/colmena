@@ -435,9 +435,15 @@ func (s *RPCService) Query(req *RPCQueryRequest, resp *RPCQueryResponse) error {
 		ptrs := make([]any, len(cols))
 		for i := range values { ptrs[i] = &values[i] }
 		if err := rows.Scan(ptrs...); err != nil { resp.Error = err.Error(); return nil }
-		rowData := make([]json.RawMessage, len(cols))
-		for i, v := range values { b, _ := json.Marshal(v); rowData[i] = b }
-		resp.Rows = append(resp.Rows, rowData)
+		tagged := make([]TaggedValue, len(cols))
+		legacy := make([]json.RawMessage, len(cols))
+		for i, v := range values {
+			tagged[i] = encodeTaggedValue(v)
+			b, _ := json.Marshal(v)
+			legacy[i] = b
+		}
+		resp.TaggedRows = append(resp.TaggedRows, tagged)
+		resp.Rows = append(resp.Rows, legacy)
 	}
 	if err := rows.Err(); err != nil { resp.Error = err.Error() }
 	return nil

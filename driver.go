@@ -133,7 +133,7 @@ func (c *colmenaConn) leaderQuery(query string, args []any) (driver.Rows, error)
 		return nil, err
 	}
 	c.node.metrics.readsTotal.Add(1)
-	return &rpcRows{columns: resp.Columns, data: resp.Rows}, nil
+	return &rpcRows{columns: resp.Columns, tagged: resp.TaggedRows, legacy: resp.Rows}, nil
 }
 
 // --- Transaction ---
@@ -240,7 +240,8 @@ func (r *wrappedRows) Next(dest []driver.Value) error {
 
 type rpcRows struct {
 	columns []string
-	data    [][]json.RawMessage
+	tagged  [][]TaggedValue   // v0.6.1+ type-preserving payload (preferred)
+	legacy  [][]json.RawMessage // v0.6.0 peer fallback
 	pos     int
 }
 
@@ -248,10 +249,25 @@ func (r *rpcRows) Columns() []string { return r.columns }
 func (r *rpcRows) Close() error      { return nil }
 
 func (r *rpcRows) Next(dest []driver.Value) error {
-	if r.pos >= len(r.data) {
+	if len(r.tagged) > 0 {
+		if r.pos >= len(r.tagged) {
+			return io.EOF
+		}
+		row := r.tagged[r.pos]
+		r.pos++
+		for i, tv := range row {
+			v, err := decodeTaggedValue(tv)
+			if err != nil {
+				return err
+			}
+			dest[i] = v
+		}
+		return nil
+	}
+	if r.pos >= len(r.legacy) {
 		return io.EOF
 	}
-	row := r.data[r.pos]
+	row := r.legacy[r.pos]
 	r.pos++
 	for i, raw := range row {
 		var v any

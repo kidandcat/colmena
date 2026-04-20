@@ -2,7 +2,7 @@ package colmena
 
 // LibraryVersion is the semver string for the current Colmena release.
 // Bump on every tagged release. Used by Version() and exposed in Stats().
-const LibraryVersion = "0.6.0"
+const LibraryVersion = "0.6.1"
 
 // Wire format versions. Each envelope type has its own monotonically
 // increasing version. A node that reads an envelope with an unknown (newer)
@@ -25,7 +25,12 @@ const (
 
 	// ProtocolVersion is the RPC handshake version. Bumped when the RPC
 	// method set or argument shapes change in an incompatible way.
-	ProtocolVersion = 1
+	//
+	// v2 (0.6.1): RPCQueryResponse.TaggedRows carries type-preserving values
+	// so forwarded reads can reconstruct time.Time and other driver-specific
+	// types. v1 peers still fill RPCQueryResponse.Rows; v2 readers fall back
+	// to Rows when TaggedRows is empty.
+	ProtocolVersion = 2
 )
 
 // Version returns the library version this node is running.

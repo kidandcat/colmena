@@ -113,8 +113,19 @@ type RPCQueryRequest struct {
 }
 
 // RPCQueryResponse is the leader's response to a forwarded query.
+//
+// Rows (legacy, pre-0.6.1) carries JSON-marshaled driver values. String-
+// serialized time.Time values lose their type there and fail to Scan into
+// *time.Time on the caller. TaggedRows (0.6.1+) preserves Go type via a
+// per-value discriminator.
+//
+// The leader fills both fields when it suspects the peer is legacy (it does
+// not know the peer version cheaply here, so it always fills TaggedRows and
+// leaves Rows empty). A v0.6.1+ reader prefers TaggedRows when present and
+// falls back to Rows for compatibility with v0.6.0 leaders.
 type RPCQueryResponse struct {
-	Columns []string
-	Rows    [][]json.RawMessage
-	Error   string
+	Columns    []string
+	Rows       [][]json.RawMessage
+	TaggedRows [][]TaggedValue
+	Error      string
 }

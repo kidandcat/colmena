@@ -39,7 +39,7 @@ db.QueryRow("SELECT value FROM kv WHERE key = ?", "hello").Scan(&value)
 - **`database/sql` compatible** — drop-in distributed database for Go programs.
 - **Automatic leader forwarding** — write from any node, it routes to the leader via RPC.
 - **Configurable read consistency** — `None` (local), `Weak` (leader check), `Strong` (quorum verify).
-- **Automatic write batching** — concurrent writes are coalesced into a single Raft entry, giving **100×+ throughput** under load (~5,000 ops/sec on a 3-node cluster).
+- **Automatic write batching** — concurrent writes are coalesced into a single Raft entry, giving **60×+ throughput** under load (~3,000–4,000 ops/sec on a 3-node cluster, see [Benchmarks](#benchmarks)).
 - **Buffered transactions** — `db.Begin()`/`tx.Commit()` batches writes into a single Raft entry.
 - **Continuous backup** — Litestream-style WAL streaming to local filesystem or S3.
 - **Leader forwarding for custom handlers** — type-safe `Forward[Req, Resp]()` sends any request to the leader via RPC.
@@ -345,50 +345,50 @@ colmena.Config{
 
 ## Benchmarks
 
-Measured on Apple M1 Pro, 3-node cluster running on localhost. All numbers use the default config (`BatchWindow=2ms`, `BatchMaxSize=128`). Network latency in production will increase write times proportionally.
+Measured on Apple M1 Pro, 3-node cluster running on localhost, colmena v0.6.2. All numbers use the default config (`BatchWindow=2ms`, `BatchMaxSize=128`) unless noted. Network latency in production will increase write times proportionally.
 
 ### Write throughput scales with concurrency
 
 This is the headline result. Because the batcher coalesces concurrent writes into a single Raft entry, throughput grows with the number of concurrent writers rather than being capped by Raft's per-entry fsync.
 
-| Concurrent writers | Batching disabled | Default (`BatchWindow=2ms`) | Batch + `UnsafeNoRaftLogFsync` |
-|---:|---:|---:|---:|
-| 4 | 58 | 152 | — |
-| 32 | 97 | 1,421 | — |
-| 128 | — | **5,260** | **78,976** |
+| Concurrent writers | Batching disabled | `BatchWindow=2ms` | `BatchWindow=5ms` | Batch + `UnsafeNoRaftLogFsync` |
+|---:|---:|---:|---:|---:|
+| 4 | 50 | 92 | — | — |
+| 32 | 125 | 828 | — | — |
+| 128 | — | **3,154** | **4,224** | **69,273** |
 
-Numbers in ops/sec, 3-node cluster, 5-second sustained writes. Rule of thumb: if your workload has even a handful of concurrent writers, you get 1,000+ ops/sec; at 100+ writers you saturate SQLite on the leader, not Raft.
+Numbers in ops/sec, 3-node cluster, 5-second sustained writes. Rule of thumb: if your workload has even a handful of concurrent writers, you get 1,000+ ops/sec; at 100+ writers you saturate SQLite on the leader, not Raft. A single serial writer is the worst case — the batcher has nothing to coalesce with, so throughput falls to ~80 ops/sec.
 
 ### Per-operation benchmarks
 
-| Operation | ns/op | Parallel throughput (8 cores) | Allocations |
-|---|---:|---:|---:|
-| Write (1 node, 1 writer) | 11.4ms | — | 138 allocs/op |
-| Write (1 node, parallel) | 1.45ms | ~5,500 ops/sec | 39 allocs/op |
-| Write (3 nodes, 1 writer on leader) | 22.4ms | — | 706 allocs/op |
-| Write (3 nodes, 1 writer from follower) | 19.7ms | — | 725 allocs/op |
-| Write (3 nodes, parallel on leader) | 2.84ms | ~2,800 ops/sec | 134 allocs/op |
-| Transaction (3 stmts, 1 node) | 10.7ms | — | 175 allocs/op |
-| Read (1 node) | 6.1µs | 162,000 ops/sec | 24 allocs/op |
-| Read (3 nodes, follower local) | 5.95µs | 168,000 ops/sec | 23 allocs/op |
+| Operation | ns/op | Parallel throughput (8 cores) |
+|---|---:|---:|
+| Write (1 node, 1 writer) | 12.5ms | — |
+| Write (1 node, parallel) | 1.43ms | ~5,600 ops/sec |
+| Write (3 nodes, 1 writer on leader) | 26.0ms | — |
+| Write (3 nodes, 1 writer from follower) | 25.4ms | — |
+| Write (3 nodes, parallel on leader) | 3.24ms | ~2,500 ops/sec |
+| Transaction (3 stmts, 1 node) | 11.9ms | — |
+| Read (1 node) | 6.17µs | 162,000 ops/sec |
+| Read (3 nodes, follower local) | 6.10µs | 164,000 ops/sec |
 
 ### Latency distribution (3 nodes, 200 samples)
 
 | Operation | P50 | P95 | P99 | Max |
 |---|---:|---:|---:|---:|
-| Write (leader) | 25ms | 31ms | 34ms | 34ms |
-| Write (follower→leader) | 20ms | 27ms | 31ms | 33ms |
-| Read (strong, quorum verify) | 76µs | 133µs | 165µs | 675µs |
-| Read (local, follower) | **8µs** | 10µs | 72µs | 460µs |
+| Write (leader) | 39ms | 52ms | 66ms | 66ms |
+| Write (follower→leader) | 42ms | 55ms | 62ms | 65ms |
+| Read (strong, quorum verify) | 128µs | 255µs | 363µs | 1.8ms |
+| Read (local, follower) | **11µs** | 15µs | 103µs | 735µs |
 
 Serial-writer latency picks up ~2ms from the default batch window (the batcher waits for a potential co-traveler before flushing). If your workload is a single writer issuing statements serially and latency matters more than throughput, set `BatchWindow: 500 * time.Microsecond` or `BatchWindow: -1` to disable.
 
 **Key takeaways:**
-- Local reads are essentially raw SQLite speed (~6-8µs).
-- Single-writer write latency is dominated by Raft consensus (~25ms for quorum round-trip + fsync).
-- Throughput scales through write batching: a single Raft entry carries up to `BatchMaxSize` (128) statements.
-- Leader forwarding overhead is small (~3-5ms) — writing from a follower is nearly as fast as writing on the leader.
-- `UnsafeNoRaftLogFsync` gives ~15× additional throughput by skipping BoltDB fsync, at the cost of losing the log tail on a crash. Safe with 3+ node clusters (peers re-replicate missing entries on restart) or ephemeral deployments.
+- Local reads from a follower match single-node raw SQLite speed (~6µs), so read-heavy workloads scale horizontally for free.
+- Single-writer write latency is dominated by Raft consensus (~40ms P50 for quorum round-trip + fsync on localhost).
+- Throughput scales through write batching: a single Raft entry carries up to `BatchMaxSize` (128) statements. Expect ~60× lift between 4 and 128 concurrent writers at the default 2ms window.
+- Leader forwarding overhead is negligible (~3ms) — writing from a follower is as fast as writing on the leader, and the `TaggedValue` wire format (v0.6.1+) preserves driver types like `time.Time` across the hop.
+- `UnsafeNoRaftLogFsync` gives ~20× additional throughput by skipping BoltDB fsync, at the cost of losing the log tail on a crash. Safe with 3+ node clusters (peers re-replicate missing entries on restart) or ephemeral deployments.
 
 Run benchmarks yourself:
 

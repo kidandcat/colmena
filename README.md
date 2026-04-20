@@ -412,7 +412,7 @@ Call `node.Version()` to read the current library version at runtime.
 
 ## Limitations
 
-- **No non-deterministic SQL functions** — `RANDOM()`, `datetime('now')`, etc. produce different values on each node. Pass values as parameters instead.
+- **No non-deterministic SQL functions** — `RANDOM()`, `datetime('now')`, `CURRENT_TIMESTAMP`, `last_insert_rowid()` and friends produce different values on each node, which would silently diverge the replicas. Colmena **rejects** such statements at the write path with `ErrNonDeterministicSQL` before they enter Raft; compute the value in Go and pass it as a parameter instead. Deterministic calls like `datetime('2020-01-01', '+1 day')` are allowed.
 - **Single writer** — all writes serialize through the Raft leader. This is inherent to Raft consensus.
 - **Statement-level replication** — SQL statements (not WAL pages) are replicated. This is simpler but means the above limitation applies.
 - **Reads in transactions** — `tx.Query()` reads from local SQLite and won't see uncommitted writes buffered in the same transaction.

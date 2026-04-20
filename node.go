@@ -233,6 +233,9 @@ func (n *Node) Close() error {
 }
 
 func (n *Node) execute(cmd *Command) (*ApplyResult, error) {
+	if err := validateWriteStatements(cmd.Statements); err != nil {
+		return nil, err
+	}
 	var result *ApplyResult
 	var err error
 	if n.raft.State() == raft.Leader {

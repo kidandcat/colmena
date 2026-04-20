@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 )
 
 // Migration represents a single database migration.
@@ -22,11 +23,13 @@ type Migration struct {
 func (n *Node) Migrate(migrations []Migration) error {
 	db := n.DB()
 
-	// 1. Create the migrations tracking table.
+	// 1. Create the migrations tracking table. applied_at has no DEFAULT —
+	// the leader stamps the value and replicates it so every node sees the
+	// same time (datetime('now') would be evaluated per-replica).
 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS _migrations (
 		version    INTEGER PRIMARY KEY,
 		name       TEXT,
-		applied_at DATETIME DEFAULT (datetime('now'))
+		applied_at DATETIME
 	)`)
 	if err != nil {
 		return fmt.Errorf("colmena: create _migrations table: %w", err)
@@ -66,8 +69,9 @@ func (n *Node) Migrate(migrations []Migration) error {
 			}
 		}
 
-		// Record the migration as applied.
-		_, err := db.Exec("INSERT INTO _migrations (version, name) VALUES (?, ?)", m.Version, m.Name)
+		// Record the migration as applied. Timestamp is computed on the
+		// caller (leader) side and replicated as a parameter.
+		_, err := db.Exec("INSERT INTO _migrations (version, name, applied_at) VALUES (?, ?, ?)", m.Version, m.Name, time.Now().UTC())
 		if err != nil {
 			return fmt.Errorf("colmena: record migration %d (%s): %w", m.Version, m.Name, err)
 		}

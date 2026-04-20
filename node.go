@@ -122,7 +122,7 @@ func New(cfg Config) (*Node, error) {
 		stores:     sm,
 		raft:       r,
 		fsm:        f,
-		rpcPool:    newRPCPool(cfg.TLSConfig),
+		rpcPool:    newRPCPool(cfg.TLSConfig, cfg.NodeID),
 		handlers:   handlerRegistry{handlers: make(map[string]func([]byte) ([]byte, error))},
 		dbs:        make(map[string]*sql.DB),
 	}
@@ -362,7 +362,54 @@ func (n *Node) RemoveNode(nodeID string) error {
 
 type RPCJoinRequest struct{ NodeID, Address string }
 type RPCJoinResponse struct{ Error, LeaderAddr string }
+
+// RPCHelloRequest is sent by a node when it first opens an RPC connection
+// to another node. It lets peers detect version skew *early* (before a
+// command with an unreadable envelope reaches the log) instead of at
+// apply time.
+type RPCHelloRequest struct {
+	NodeID                string
+	LibraryVersion        string
+	ProtocolVersion       int
+	CommandFormatVersion  int
+	SnapshotFormatVersion int
+}
+
+// RPCHelloResponse mirrors the fields so the caller can log/diff them.
+type RPCHelloResponse struct {
+	NodeID                string
+	LibraryVersion        string
+	ProtocolVersion       int
+	CommandFormatVersion  int
+	SnapshotFormatVersion int
+}
+
 type RPCService struct{ node *Node }
+
+// Hello is a version handshake. It never fails: the goal is to surface
+// incompatibilities through logs and metrics without breaking clusters that
+// are intentionally running mixed versions during a rolling upgrade. The
+// dialer is responsible for deciding what to do with the response.
+func (s *RPCService) Hello(req *RPCHelloRequest, resp *RPCHelloResponse) error {
+	if req.ProtocolVersion != ProtocolVersion {
+		log.Printf("colmena: peer %s (v%s) has protocol=%d, local=%d — expect RPC incompatibility",
+			req.NodeID, req.LibraryVersion, req.ProtocolVersion, ProtocolVersion)
+	}
+	if req.CommandFormatVersion > CommandFormatVersion {
+		log.Printf("colmena: peer %s (v%s) writes command format v%d, local max v%d — will reject its log entries",
+			req.NodeID, req.LibraryVersion, req.CommandFormatVersion, CommandFormatVersion)
+	}
+	if req.SnapshotFormatVersion > SnapshotFormatVersion {
+		log.Printf("colmena: peer %s (v%s) writes snapshot format v%d, local max v%d — will reject its snapshots",
+			req.NodeID, req.LibraryVersion, req.SnapshotFormatVersion, SnapshotFormatVersion)
+	}
+	resp.NodeID = s.node.config.NodeID
+	resp.LibraryVersion = LibraryVersion
+	resp.ProtocolVersion = ProtocolVersion
+	resp.CommandFormatVersion = CommandFormatVersion
+	resp.SnapshotFormatVersion = SnapshotFormatVersion
+	return nil
+}
 
 func (s *RPCService) Execute(req *RPCExecuteRequest, resp *RPCExecuteResponse) error {
 	if s.node.raft.State() != raft.Leader { resp.Error = "not the leader"; return nil }

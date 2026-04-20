@@ -398,6 +398,18 @@ go test -run TestBatchingThroughput -v -timeout 300s .
 go test -run TestLatencyDistribution -v -timeout 120s .
 ```
 
+## Versioning & Upgrades
+
+Colmena wraps every replicated/persisted blob in a 10-byte self-describing envelope (`COLMENA\x00` magic + kind + version) so nodes can detect format skew and refuse to silently misinterpret data written by a future release.
+
+- **Commands** in the Raft log are tagged with `CommandFormatVersion`.
+- **FSM snapshots** are tagged with `SnapshotFormatVersion`.
+- The **RPC handshake** (`Colmena.Hello`) runs on every new connection and logs a warning when peers disagree on any version.
+
+Each Colmena release keeps the decoder for the previous envelope version in place for **at least one release**, so rolling upgrades (stop node → upgrade → rejoin, one at a time) work without wiping data. Legacy pre-envelope shapes (raw JSON commands, raw-SQLite v0.2.0 snapshots, unenveloped tar v0.3–v0.5 snapshots) are still recognized for backward compatibility. A node that sees an **unknown newer** envelope version returns `ErrUnsupportedFormatVersion` instead of corrupting state — upgrade the lagging node before proceeding.
+
+Call `node.Version()` to read the current library version at runtime.
+
 ## Limitations
 
 - **No non-deterministic SQL functions** — `RANDOM()`, `datetime('now')`, etc. produce different values on each node. Pass values as parameters instead.

@@ -3,6 +3,7 @@ package colmena
 import (
 	"crypto/tls"
 	"fmt"
+	"log"
 	"net"
 	"net/rpc"
 	"sync"
@@ -16,19 +17,28 @@ type rpcPool struct {
 	clients   map[string]*rpcEntry
 	tlsConfig *tls.Config
 	maxIdle   time.Duration
+
+	// localNodeID is sent in the Hello handshake so the peer can log which
+	// node is connecting. Zero value is fine (the handshake is log-only).
+	localNodeID string
 }
 
 type rpcEntry struct {
 	client   *rpc.Client
 	lastUsed time.Time
 	failures int
+
+	// peerVersion is populated by the Hello handshake after dial. Used for
+	// metrics/introspection; not consulted on the hot path.
+	peerVersion string
 }
 
-func newRPCPool(tlsConfig *tls.Config) *rpcPool {
+func newRPCPool(tlsConfig *tls.Config, localNodeID string) *rpcPool {
 	return &rpcPool{
-		clients:   make(map[string]*rpcEntry),
-		tlsConfig: tlsConfig,
-		maxIdle:   5 * time.Minute,
+		clients:     make(map[string]*rpcEntry),
+		tlsConfig:   tlsConfig,
+		maxIdle:     5 * time.Minute,
+		localNodeID: localNodeID,
 	}
 }
 
@@ -58,11 +68,39 @@ func (p *rpcPool) get(raftAddr string) (*rpc.Client, error) {
 		return nil, err
 	}
 
-	p.clients[rpcAddr] = &rpcEntry{
+	entry := &rpcEntry{
 		client:   client,
 		lastUsed: time.Now(),
 	}
+	// Best-effort version handshake. Failures are logged but don't tear down
+	// the connection — the peer might be an older Colmena that doesn't know
+	// the Hello method, and we still want its Execute/Query/Join calls to work.
+	p.sayHello(rpcAddr, entry)
+	p.clients[rpcAddr] = entry
 	return client, nil
+}
+
+// sayHello runs the version handshake after a successful dial. Updates the
+// entry's peerVersion on success; logs a single warning on failure.
+func (p *rpcPool) sayHello(rpcAddr string, entry *rpcEntry) {
+	req := &RPCHelloRequest{
+		NodeID:                p.localNodeID,
+		LibraryVersion:        LibraryVersion,
+		ProtocolVersion:       ProtocolVersion,
+		CommandFormatVersion:  CommandFormatVersion,
+		SnapshotFormatVersion: SnapshotFormatVersion,
+	}
+	var resp RPCHelloResponse
+	if err := entry.client.Call("Colmena.Hello", req, &resp); err != nil {
+		// Older peer doesn't know Colmena.Hello. Log once, keep the connection.
+		log.Printf("colmena: handshake with %s failed (likely older peer): %v", rpcAddr, err)
+		return
+	}
+	entry.peerVersion = resp.LibraryVersion
+	if resp.ProtocolVersion != ProtocolVersion {
+		log.Printf("colmena: peer %s runs protocol v%d, local v%d — expect issues",
+			rpcAddr, resp.ProtocolVersion, ProtocolVersion)
+	}
 }
 
 // markFailed records that an RPC call to this address failed,

@@ -749,7 +749,7 @@ func TestRPCPool_GetDialsNewConnection(t *testing.T) {
 	raftPort := rpcPort - 1
 	raftAddr := fmt.Sprintf("127.0.0.1:%d", raftPort)
 
-	pool := newRPCPool(nil)
+	pool := newRPCPool(nil, "test")
 	defer pool.close()
 
 	client, err := pool.get(raftAddr)
@@ -788,7 +788,7 @@ func TestRPCPool_CachesConnection(t *testing.T) {
 	fmt.Sscanf(portStr, "%d", &rpcPort)
 	raftAddr := fmt.Sprintf("127.0.0.1:%d", rpcPort-1)
 
-	pool := newRPCPool(nil)
+	pool := newRPCPool(nil, "test")
 	defer pool.close()
 
 	c1, err := pool.get(raftAddr)
@@ -830,7 +830,7 @@ func TestRPCPool_MarkFailedCausesReconnect(t *testing.T) {
 	fmt.Sscanf(portStr, "%d", &rpcPort)
 	raftAddr := fmt.Sprintf("127.0.0.1:%d", rpcPort-1)
 
-	pool := newRPCPool(nil)
+	pool := newRPCPool(nil, "test")
 	defer pool.close()
 
 	c1, err := pool.get(raftAddr)
@@ -881,7 +881,7 @@ func TestRPCPool_CloseShutdown(t *testing.T) {
 	fmt.Sscanf(portStr, "%d", &rpcPort)
 	raftAddr := fmt.Sprintf("127.0.0.1:%d", rpcPort-1)
 
-	pool := newRPCPool(nil)
+	pool := newRPCPool(nil, "test")
 
 	_, err = pool.get(raftAddr)
 	if err != nil {
@@ -900,7 +900,7 @@ func TestRPCPool_CloseShutdown(t *testing.T) {
 }
 
 func TestRPCPool_GetInvalidAddress(t *testing.T) {
-	pool := newRPCPool(nil)
+	pool := newRPCPool(nil, "test")
 	defer pool.close()
 
 	// Address with no listening server.
@@ -911,7 +911,7 @@ func TestRPCPool_GetInvalidAddress(t *testing.T) {
 }
 
 func TestRPCPool_MarkFailed_UnknownAddr(t *testing.T) {
-	pool := newRPCPool(nil)
+	pool := newRPCPool(nil, "test")
 	defer pool.close()
 
 	// Marking an unknown address should not panic.
@@ -1338,7 +1338,7 @@ func TestRPCPool_StaleConnectionReconnects(t *testing.T) {
 	fmt.Sscanf(portStr, "%d", &rpcPort)
 	raftAddr := fmt.Sprintf("127.0.0.1:%d", rpcPort-1)
 
-	pool := newRPCPool(nil)
+	pool := newRPCPool(nil, "test")
 	defer pool.close()
 
 	// Override maxIdle to a tiny value to simulate staleness.
@@ -1396,7 +1396,7 @@ func TestRPCPool_DialWithTLS(t *testing.T) {
 
 	clientTLS := tlsCfg.Clone()
 	clientTLS.ClientAuth = tls.NoClientCert
-	pool := newRPCPool(clientTLS)
+	pool := newRPCPool(clientTLS, "test")
 	defer pool.close()
 
 	client, err := pool.get(raftAddr)

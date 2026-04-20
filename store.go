@@ -2,9 +2,11 @@ package colmena
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -299,11 +301,20 @@ func (sm *storeManager) get(name string) (*store, error) {
 	return s, nil
 }
 
-// snapshot writes a tar archive containing all database files to w.
-// Each entry is named "<dbname>.db".
+// snapshot writes a versioned snapshot to w:
+//
+//	[10-byte envelope: magic|kind=Snapshot|version=1] [tar archive of .db files]
+//
+// Pre-v0.6 Colmena wrote the tar archive without an envelope (and v0.2.0
+// wrote a single raw SQLite file). Both shapes are still accepted by
+// restore() so rolling upgrades and old backups keep working.
 func (sm *storeManager) snapshot(w io.Writer) error {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
+
+	if err := writeEnvelopeHeader(w, FormatKindSnapshot, SnapshotFormatVersion); err != nil {
+		return fmt.Errorf("colmena: snapshot header: %w", err)
+	}
 
 	tw := tar.NewWriter(w)
 
@@ -331,8 +342,17 @@ func (sm *storeManager) snapshot(w io.Writer) error {
 	return tw.Close()
 }
 
-// restore closes all stores, extracts a tar archive of database files, and
-// reopens the stores.
+// restore closes all stores and rebuilds them from a snapshot stream. It
+// accepts three historical shapes (detected by sniffing the first bytes):
+//
+//  1. v0.6+ enveloped tar: magic|kind=Snapshot|version=1 followed by tar.
+//  2. v0.3..v0.5 unenveloped tar: the tar archive directly (stream starts
+//     with a POSIX tar header, not a SQLite page).
+//  3. v0.2.0 raw SQLite file: a single database written directly, restored
+//     as the "default" store.
+//
+// Unknown envelope versions return ErrUnsupportedFormatVersion so the node
+// refuses to load a snapshot it can't interpret.
 func (sm *storeManager) restore(r io.Reader) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -343,7 +363,49 @@ func (sm *storeManager) restore(r io.Reader) error {
 	}
 	sm.stores = make(map[string]*store)
 
-	// Extract tar entries.
+	// Buffered reader lets us peek without consuming.
+	br := bufio.NewReader(r)
+
+	// Peek enough bytes to identify all three legacy shapes plus our envelope.
+	// 16 bytes is enough: envelope magic is 8, raw SQLite magic is 16.
+	const peekSize = 16
+	peek, err := br.Peek(peekSize)
+	if err != nil && err != io.EOF && !errors.Is(err, bufio.ErrBufferFull) {
+		return fmt.Errorf("colmena: snapshot peek: %w", err)
+	}
+
+	switch {
+	case hasEnvelopeMagic(peek):
+		// Consume the 10-byte header, then extract tar.
+		var hdr [envelopeHeaderSize]byte
+		if _, err := io.ReadFull(br, hdr[:]); err != nil {
+			return fmt.Errorf("colmena: snapshot header: %w", err)
+		}
+		kind := FormatKind(hdr[8])
+		version := hdr[9]
+		if kind != FormatKindSnapshot {
+			return fmt.Errorf("colmena: snapshot: unexpected envelope kind %d", kind)
+		}
+		switch version {
+		case 1:
+			return sm.restoreTar(br)
+		default:
+			return fmt.Errorf("colmena: snapshot version %d: %w", version, ErrUnsupportedFormatVersion)
+		}
+
+	case looksLikeRawSQLite(peek):
+		// v0.2.0 legacy: single raw SQLite file, becomes the "default" store.
+		return sm.restoreRawSQLite(br)
+
+	default:
+		// Assume legacy unenveloped tar (v0.3..v0.5).
+		return sm.restoreTar(br)
+	}
+}
+
+// restoreTar extracts a tar archive of <name>.db entries into the data dir
+// and reopens every discovered store.
+func (sm *storeManager) restoreTar(r io.Reader) error {
 	tr := tar.NewReader(r)
 	for {
 		hdr, err := tr.Next()
@@ -354,11 +416,9 @@ func (sm *storeManager) restore(r io.Reader) error {
 			return fmt.Errorf("colmena: tar read: %w", err)
 		}
 
-		// Entry name is "foo.db", derive the db name.
 		name := strings.TrimSuffix(hdr.Name, ".db")
 		dbPath := filepath.Join(sm.dataDir, hdr.Name)
 
-		// Remove leftover WAL/SHM files.
 		os.Remove(dbPath + "-wal")
 		os.Remove(dbPath + "-shm")
 
@@ -373,7 +433,32 @@ func (sm *storeManager) restore(r io.Reader) error {
 		f.Close()
 	}
 
-	// Reopen all database files found in the data directory.
+	return sm.reopenAllFromDir()
+}
+
+// restoreRawSQLite handles v0.2.0 snapshots, which are a single SQLite
+// database file with no wrapper. The file is written as "default.db".
+func (sm *storeManager) restoreRawSQLite(r io.Reader) error {
+	dbPath := filepath.Join(sm.dataDir, "default.db")
+	os.Remove(dbPath + "-wal")
+	os.Remove(dbPath + "-shm")
+
+	f, err := os.Create(dbPath)
+	if err != nil {
+		return fmt.Errorf("colmena: restore legacy create: %w", err)
+	}
+	if _, err := io.Copy(f, r); err != nil {
+		f.Close()
+		return fmt.Errorf("colmena: restore legacy copy: %w", err)
+	}
+	f.Close()
+
+	return sm.reopenAllFromDir()
+}
+
+// reopenAllFromDir scans the data directory and opens every *.db file
+// (except raft.db) as a store. Called at the end of each restore path.
+func (sm *storeManager) reopenAllFromDir() error {
 	entries, err := os.ReadDir(sm.dataDir)
 	if err != nil {
 		return fmt.Errorf("colmena: readdir after restore: %w", err)
@@ -382,7 +467,6 @@ func (sm *storeManager) restore(r io.Reader) error {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".db") {
 			continue
 		}
-		// Skip raft.db and any non-colmena files.
 		if e.Name() == "raft.db" {
 			continue
 		}
@@ -394,8 +478,14 @@ func (sm *storeManager) restore(r io.Reader) error {
 		}
 		sm.stores[name] = s
 	}
-
 	return nil
+}
+
+// sqliteMagic is the fixed first 16 bytes of every SQLite 3 database file.
+var sqliteMagic = []byte("SQLite format 3\x00")
+
+func looksLikeRawSQLite(b []byte) bool {
+	return len(b) >= len(sqliteMagic) && bytes.Equal(b[:len(sqliteMagic)], sqliteMagic)
 }
 
 // close closes all managed stores.

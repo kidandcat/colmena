@@ -263,6 +263,59 @@ How it works:
 - The `HandlerKey[Req, Resp]` ensures that request and response types match at compile time — no raw strings or `interface{}` at the call site.
 - Handlers must be registered before calling `Forward`. Registering the same key twice panics.
 
+## Background Jobs
+
+Colmena ships with a first-class background job system in the `jobs` subpackage. It uses the same Raft log and SQLite store, so jobs survive restarts, replicate across the cluster, and don't need Redis, Postgres or any external broker.
+
+```go
+import (
+    "github.com/kidandcat/colmena"
+    "github.com/kidandcat/colmena/jobs"
+)
+
+node, _ := colmena.New(colmena.Config{...})
+defer node.Close()
+
+jm, _ := jobs.New(node, jobs.Config{Workers: 16})
+defer jm.Close()
+
+type ScrapeArgs struct{ Page int }
+
+jobs.Register(jm, "scrape", func(ctx jobs.Context, a ScrapeArgs) error {
+    return doScrape(ctx, a.Page)
+})
+
+// One-off
+id, _ := jobs.Enqueue(jm, "scrape", ScrapeArgs{Page: 1})
+
+// With options
+_, _ = jobs.Enqueue(jm, "scrape", ScrapeArgs{Page: 2},
+    jobs.WithPriority(jobs.PriorityHigh),
+    jobs.WithRunAt(time.Now().Add(10*time.Minute)),
+    jobs.WithMaxAttempts(3),
+    jobs.WithUniqueKey("scrape:page:2"),
+)
+
+// Recurring (5-field cron)
+_ = jobs.Schedule(jm, "refresh-airing", "refresh_airing", "0 */6 * * *", RefreshArgs{})
+_ = jobs.Schedule(jm, "scrape-news",    "scrape_news",    "*/15 * * * *", ScrapeNewsArgs{})
+
+// Cluster-wide rate / concurrency limits
+_ = jobs.SetConcurrency(jm, "scrape_justwatch", 2)
+_ = jobs.SetRateLimit(jm,   "scrape_justwatch", jobs.Rate{N: 30, Per: time.Minute})
+```
+
+Properties:
+
+- **Cluster-safe claim** — a claim is a single atomic UPDATE through Raft, so two nodes racing for the same job converge to exactly one winner.
+- **Retries** — exponential backoff with jitter; jobs that exceed `max_attempts` move to status `dead`.
+- **Sweeper** — leader-only loop that reclaims jobs whose worker died (no progress past `timeout_ms`).
+- **Cron scheduler** — leader-only goroutine; the parser supports `*`, `*/N`, `N`, `N-M`, `N-M/S`, and lists.
+- **Dedup** — `WithUniqueKey` collapses repeats while a job with that key is pending or running.
+- **Observability** — `jm.Stats()`, `jobs.MetricsHandler(jm)` for Prometheus, `jobs.AdminHandler(jm)` for a read-only HTML dashboard at e.g. `/admin/jobs/`.
+
+Schema (`colmena_jobs`, `colmena_jobs_schedule`, `colmena_jobs_ratelimit`, `colmena_jobs_concurrency`) is migrated automatically the first time `jobs.New` runs in the cluster.
+
 ## Multiple Databases
 
 A single Raft cluster can host multiple independent SQLite databases, each with its own default consistency level. Each database maps to a separate `.db` file on disk.

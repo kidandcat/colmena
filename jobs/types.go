@@ -48,8 +48,10 @@ type Backoff struct {
 	Max  time.Duration
 }
 
-// Rate is a token-bucket rate limit: at most N jobs of a given type may be
-// claimed per Per duration cluster-wide.
+// Rate is a sliding-window rate limit: at most N jobs of a given type may
+// have started within any rolling window of duration Per, cluster-wide.
+// The check is part of the atomic claim UPDATE, so the limit is honoured
+// exactly across nodes — no token-bucket reservation to keep in sync.
 type Rate struct {
 	N   int
 	Per time.Duration

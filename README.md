@@ -44,6 +44,7 @@ db.QueryRow("SELECT value FROM kv WHERE key = ?", "hello").Scan(&value)
 - **Continuous backup** — Litestream-style WAL streaming to local filesystem or S3.
 - **Leader forwarding for custom handlers** — type-safe `Forward[Req, Resp]()` sends any request to the leader via RPC.
 - **Reactive hooks** — `OnApply` callback fires on every node after each replicated write.
+- **Background jobs** — first-class job queue in `colmena/jobs`: typed handlers, retries with exponential backoff, cron schedules, cluster-wide concurrency and rate limits, all backed by the same Raft log. No Redis, no external broker. See [Background Jobs](#background-jobs).
 
 ## Quick Start
 

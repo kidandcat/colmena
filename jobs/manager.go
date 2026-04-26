@@ -152,7 +152,7 @@ func (m *Manager) runHandler(j *Job) (err error) {
 		}
 	}()
 
-	return entry.fn(jc, j.Payload)
+	return entry.fn(jc, []byte(j.Payload))
 }
 
 // errNoHandler is a sentinel — the worker treats it specially (releases the

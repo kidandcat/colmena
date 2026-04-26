@@ -13,9 +13,6 @@ import (
 func (m *Manager) sweeperLoop() {
 	defer m.wg.Done()
 
-	// Token-bucket refill is also done here on the leader. It piggybacks
-	// on the sweep tick because both are leader-only periodic tasks; a
-	// dedicated goroutine would just add a second source of writes.
 	tick := time.NewTicker(m.config.SweepInterval)
 	defer tick.Stop()
 
@@ -29,7 +26,6 @@ func (m *Manager) sweeperLoop() {
 			continue
 		}
 		m.sweepOnce()
-		m.refillRateLimits()
 	}
 }
 
@@ -59,22 +55,3 @@ func (m *Manager) sweepOnce() {
 	}
 }
 
-// refillRateLimits adds tokens proportional to elapsed time since the last
-// refill, clamped to capacity. Tokens are stored x1000 so we can add
-// fractional amounts (one token per (period_ms / capacity) milliseconds).
-func (m *Manager) refillRateLimits() {
-	now := time.Now().UnixMilli()
-	_, err := m.node.DB().Exec(
-		`UPDATE colmena_jobs_ratelimit
-            SET tokens_x1000 = MIN(
-                  capacity * 1000,
-                  tokens_x1000 + ((? - last_refill_ms) * capacity * 1000 / period_ms)
-                ),
-                last_refill_ms = ?
-          WHERE last_refill_ms < ?`,
-		now, now, now,
-	)
-	if err != nil {
-		log.Printf("colmena/jobs: refill rate limits: %v", err)
-	}
-}

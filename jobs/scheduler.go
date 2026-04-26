@@ -44,7 +44,7 @@ func (m *Manager) schedulerOnce() {
 	}
 	type due struct {
 		id, jobType, cronExpr string
-		payload               []byte
+		payload               string
 		nextRunAt             int64
 	}
 	var dues []due
@@ -74,7 +74,7 @@ func (m *Manager) schedulerOnce() {
                 (id, type, payload, status, priority, attempts, max_attempts,
                  enqueued_at, run_at, unique_key, timeout_ms)
              VALUES (?, ?, ?, 'pending', 0, 0, ?, ?, ?, NULL, ?)`,
-			jobID, d.jobType, d.payload, m.config.DefaultMaxAttempts,
+			jobID, d.jobType, d.payload, m.config.DefaultMaxAttempts, // payload is already a string
 			fireAt.UnixMilli(), fireAt.UnixMilli(),
 			m.config.DefaultTimeout.Milliseconds(),
 		)

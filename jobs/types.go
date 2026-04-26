@@ -26,7 +26,7 @@ const (
 type Job struct {
 	ID          string
 	Type        string
-	Payload     []byte
+	Payload     string
 	Status      Status
 	Priority    Priority
 	Attempts    int

@@ -103,12 +103,16 @@ func Enqueue[Args any](m *Manager, jobType string, args Args, opts ...EnqueueOpt
 		uniqueArg = nil
 	}
 
+	// Store payload as TEXT (string) — passing []byte goes through JSON
+	// marshal in the Raft envelope and arrives base64-encoded, which is
+	// not what we want. JSON is text anyway, so a TEXT-affinity column
+	// holds it correctly.
 	_, err = m.node.DB().Exec(
 		`INSERT INTO colmena_jobs
             (id, type, payload, status, priority, attempts, max_attempts,
              enqueued_at, run_at, unique_key, timeout_ms)
          VALUES (?, ?, ?, 'pending', ?, 0, ?, ?, ?, ?, ?)`,
-		id, jobType, payload, int(o.priority), o.maxAttempts,
+		id, jobType, string(payload), int(o.priority), o.maxAttempts,
 		now, runAtMs, uniqueArg, o.timeout.Milliseconds(),
 	)
 	if err != nil {
@@ -169,7 +173,7 @@ func Schedule[Args any](m *Manager, id, jobType, cronExpr string, args Args) err
             payload     = excluded.payload,
             next_run_at = excluded.next_run_at,
             enabled     = 1`,
-		id, jobType, cronExpr, payload, next,
+		id, jobType, cronExpr, string(payload), next,
 	)
 	if err != nil {
 		return fmt.Errorf("colmena/jobs: upsert schedule: %w", err)
@@ -207,8 +211,9 @@ func SetConcurrency(m *Manager, jobType string, cap int) error {
 	return err
 }
 
-// SetRateLimit installs a token-bucket rate limit for the given job type.
-// Setting r.N to 0 removes the limit.
+// SetRateLimit installs a sliding-window rate limit for the given job type.
+// At most r.N executions may start within any rolling r.Per window across
+// the cluster. Setting r.N to 0 removes the limit.
 func SetRateLimit(m *Manager, jobType string, r Rate) error {
 	if r.N <= 0 || r.Per <= 0 {
 		_, err := m.node.DB().Exec(
@@ -216,19 +221,13 @@ func SetRateLimit(m *Manager, jobType string, r Rate) error {
 		)
 		return err
 	}
-	now := time.Now().UnixMilli()
-	// Start with a full bucket so workers don't have to wait one period
-	// before the first job runs.
 	_, err := m.node.DB().Exec(
-		`INSERT INTO colmena_jobs_ratelimit
-            (type, capacity, period_ms, tokens_x1000, last_refill_ms)
-         VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO colmena_jobs_ratelimit (type, capacity, period_ms)
+         VALUES (?, ?, ?)
          ON CONFLICT(type) DO UPDATE SET
-            capacity      = excluded.capacity,
-            period_ms     = excluded.period_ms,
-            tokens_x1000  = excluded.tokens_x1000,
-            last_refill_ms= excluded.last_refill_ms`,
-		jobType, r.N, r.Per.Milliseconds(), r.N*1000, now,
+            capacity  = excluded.capacity,
+            period_ms = excluded.period_ms`,
+		jobType, r.N, r.Per.Milliseconds(),
 	)
 	return err
 }

@@ -12,7 +12,7 @@ import (
 // worker goroutine. Workers don't have a fixed share of the queue: every
 // worker on every node races for every eligible job. The leader serialises
 // claim writes through Raft so exactly one worker wins per job.
-func (m *Manager) workerLoop(idx int) {
+func (m *Manager) workerLoop(_ int) {
 	defer m.wg.Done()
 
 	// Spread initial polls so all workers don't hit the leader at the
@@ -64,8 +64,11 @@ func (m *Manager) tryClaimAndRun() bool {
 		return false
 	}
 
-	// Attempt the claim. This UPDATE is forwarded to the leader and
-	// applied through Raft, so concurrent claims by other nodes serialize.
+	// Atomic claim: status flip happens through Raft (leader-serialised),
+	// so the COUNT subqueries for concurrency and rate-limit are evaluated
+	// at the same moment as the WHERE id=? AND status='pending' guard.
+	// That gives us cluster-wide exactly-once semantics for both limits
+	// without a separate token bucket to keep in sync.
 	now := time.Now().UnixMilli()
 	res, err := m.node.DB().Exec(
 		`UPDATE colmena_jobs
@@ -84,9 +87,13 @@ func (m *Manager) tryClaimAndRun() bool {
             )
             AND (
                 NOT EXISTS (SELECT 1 FROM colmena_jobs_ratelimit r WHERE r.type = colmena_jobs.type)
-                OR (SELECT tokens_x1000 FROM colmena_jobs_ratelimit WHERE type = colmena_jobs.type) >= 1000
+                OR (SELECT capacity FROM colmena_jobs_ratelimit WHERE type = colmena_jobs.type)
+                   > (SELECT COUNT(*) FROM colmena_jobs
+                       WHERE type = colmena_jobs.type
+                         AND started_at IS NOT NULL
+                         AND started_at > ? - (SELECT period_ms FROM colmena_jobs_ratelimit WHERE type = colmena_jobs.type))
             )`,
-		now, m.node.NodeID(), now, candidate.ID, now,
+		now, m.node.NodeID(), now, candidate.ID, now, now,
 	)
 	if err != nil {
 		log.Printf("colmena/jobs: claim %s: %v", candidate.ID, err)
@@ -94,21 +101,8 @@ func (m *Manager) tryClaimAndRun() bool {
 	}
 	rows, _ := res.RowsAffected()
 	if rows == 0 {
-		// Lost the race or limits blocked us. Move on; we'll retry later.
+		// Lost the race, hit a limit, or run_at moved into the future.
 		return false
-	}
-
-	// Deduct one token if the type is rate-limited. This is a best-effort
-	// follow-up: under contention the token check above can succeed for
-	// two simultaneous claims and we may briefly overdraw by one. The
-	// next refill self-corrects.
-	if _, err := m.node.DB().Exec(
-		`UPDATE colmena_jobs_ratelimit
-            SET tokens_x1000 = MAX(0, tokens_x1000 - 1000)
-          WHERE type = ?`,
-		candidate.Type,
-	); err != nil {
-		log.Printf("colmena/jobs: deduct token for %s: %v", candidate.Type, err)
 	}
 
 	// Reflect the claim on our local copy so the handler context sees the

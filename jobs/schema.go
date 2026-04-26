@@ -54,15 +54,21 @@ var schemaStatements = []string{
         ON colmena_jobs_schedule(next_run_at)
         WHERE enabled = 1`,
 
-	// Token bucket per job type; one row per limited type. tokens_x1000 stores
-	// fractional tokens at millisecond granularity to avoid float math.
+	// Sliding-window rate limit per job type: at most "capacity" jobs may
+	// have started within the last "period_ms" milliseconds, cluster-wide.
+	// We measure against colmena_jobs.started_at directly so the check is
+	// part of the atomic claim UPDATE — no separate token bucket to keep
+	// in sync.
 	`CREATE TABLE IF NOT EXISTS colmena_jobs_ratelimit (
-        type            TEXT PRIMARY KEY,
-        capacity        INTEGER NOT NULL,
-        period_ms       INTEGER NOT NULL,
-        tokens_x1000    INTEGER NOT NULL,
-        last_refill_ms  INTEGER NOT NULL
+        type       TEXT PRIMARY KEY,
+        capacity   INTEGER NOT NULL,
+        period_ms  INTEGER NOT NULL
     )`,
+	// Index on started_at filtered by type makes the rate-limit subquery
+	// in the claim UPDATE O(log N) per type.
+	`CREATE INDEX IF NOT EXISTS idx_colmena_jobs_started
+        ON colmena_jobs(type, started_at)
+        WHERE started_at IS NOT NULL`,
 
 	// Per-type concurrency cap. Read by the claim transaction. NULL/missing
 	// row means unlimited.

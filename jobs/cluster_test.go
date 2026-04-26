@@ -11,10 +11,26 @@ import (
 	"github.com/kidandcat/colmena"
 )
 
-// testCluster builds a 3-node cluster and returns the bootstrap node plus
-// the join nodes. Configs share fast Raft timeouts so leader election
-// happens within the test budget.
+// testCluster builds an n-node cluster. Bind-time port conflicts trigger a
+// retry of the whole bring-up so a slow port release in CI doesn't fail
+// the test.
 func testCluster(t *testing.T, n int) []*colmena.Node {
+	t.Helper()
+
+	for attempt := 0; attempt < 5; attempt++ {
+		nodes, ok := tryStartCluster(t, n)
+		if ok {
+			time.Sleep(500 * time.Millisecond)
+			return nodes
+		}
+		// All previously-created nodes were already cleaned up via
+		// t.Cleanup hooks the failed attempt registered.
+	}
+	t.Fatal("could not start cluster after 5 attempts")
+	return nil
+}
+
+func tryStartCluster(t *testing.T, n int) ([]*colmena.Node, bool) {
 	t.Helper()
 
 	leaderPort := freePort(t)
@@ -31,11 +47,11 @@ func testCluster(t *testing.T, n int) []*colmena.Node {
 		LogOutput:         discardWriter{},
 	})
 	if err != nil {
-		t.Fatalf("bootstrap: %v", err)
+		return nil, false
 	}
 	t.Cleanup(func() { leader.Close() })
 	if err := leader.WaitForLeader(5 * time.Second); err != nil {
-		t.Fatalf("wait leader: %v", err)
+		return nil, false
 	}
 
 	nodes := []*colmena.Node{leader}
@@ -52,15 +68,12 @@ func testCluster(t *testing.T, n int) []*colmena.Node {
 			LogOutput:        discardWriter{},
 		})
 		if err != nil {
-			t.Fatalf("follower %d: %v", i, err)
+			return nil, false
 		}
 		t.Cleanup(func() { node.Close() })
 		nodes = append(nodes, node)
 	}
-
-	// Wait for replication to catch up so all followers can read replicated rows.
-	time.Sleep(500 * time.Millisecond)
-	return nodes
+	return nodes, true
 }
 
 func attachManager(t *testing.T, node *colmena.Node, configure func(*Config)) *Manager {

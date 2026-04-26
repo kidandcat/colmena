@@ -13,36 +13,45 @@ import (
 	"github.com/kidandcat/colmena"
 )
 
+var _ = os.Getpid // keep os import if other usage is conditional
+
 type discardWriter struct{}
 
 func (discardWriter) Write(p []byte) (int, error) { return len(p), nil }
 
-// testNode boots a single bootstrapped Colmena node.
+// testNode boots a single bootstrapped Colmena node. A small retry loop
+// covers the rare case where another process grabs the chosen port pair
+// between freePort's probe and colmena.New's bind.
 func testNode(t *testing.T) *colmena.Node {
 	t.Helper()
-	dir := t.TempDir()
-	port := freePort(t)
-
-	node, err := colmena.New(colmena.Config{
-		NodeID:            fmt.Sprintf("jobs-test-%d", port),
-		DataDir:           dir,
-		Bind:              fmt.Sprintf("127.0.0.1:%d", port),
-		Bootstrap:         true,
-		HeartbeatTimeout:  200 * time.Millisecond,
-		ElectionTimeout:   200 * time.Millisecond,
-		SnapshotInterval:  5 * time.Second,
-		SnapshotThreshold: 100,
-		ApplyTimeout:      5 * time.Second,
-		LogOutput:         discardWriter{},
-	})
-	if err != nil {
-		t.Fatalf("colmena.New: %v", err)
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		dir := t.TempDir()
+		port := freePort(t)
+		node, err := colmena.New(colmena.Config{
+			NodeID:            fmt.Sprintf("jobs-test-%d-%d", port, attempt),
+			DataDir:           dir,
+			Bind:              fmt.Sprintf("127.0.0.1:%d", port),
+			Bootstrap:         true,
+			HeartbeatTimeout:  200 * time.Millisecond,
+			ElectionTimeout:   200 * time.Millisecond,
+			SnapshotInterval:  5 * time.Second,
+			SnapshotThreshold: 100,
+			ApplyTimeout:      5 * time.Second,
+			LogOutput:         discardWriter{},
+		})
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		t.Cleanup(func() { node.Close() })
+		if err := node.WaitForLeader(5 * time.Second); err != nil {
+			t.Fatalf("wait leader: %v", err)
+		}
+		return node
 	}
-	t.Cleanup(func() { node.Close() })
-	if err := node.WaitForLeader(5 * time.Second); err != nil {
-		t.Fatalf("wait leader: %v", err)
-	}
-	return node
+	t.Fatalf("colmena.New (5 attempts): %v", lastErr)
+	return nil
 }
 
 func testManager(t *testing.T, opts ...func(*Config)) (*colmena.Node, *Manager) {
@@ -68,19 +77,39 @@ func testManager(t *testing.T, opts ...func(*Config)) (*colmena.Node, *Manager) 
 	return node, m
 }
 
+// portAlloc hands out fresh port pairs across the test binary so concurrent
+// or back-to-back runs don't collide on the same offset.
+var portAlloc atomic.Int32
+
 func freePort(t testing.TB) int {
 	t.Helper()
-	for i := 0; i < 100; i++ {
-		port := 19000 + (os.Getpid()+i*2)%10000
+	// Start from a random offset per binary, then advance monotonically.
+	// `-count=N` reuses the same binary, so the atomic counter still gives
+	// us fresh values between repeated runs.
+	if portAlloc.Load() == 0 {
+		// Seed with process PID + nanosecond bits so parallel `go test`
+		// runs of different packages don't trample each other.
+		seed := int32(os.Getpid()*7) ^ int32(time.Now().UnixNano())
+		portAlloc.CompareAndSwap(0, (seed%9000+1000)|1)
+	}
+	for i := 0; i < 200; i++ {
+		port := int(portAlloc.Add(2)) % 65000
+		if port < 12000 {
+			port += 12000
+		}
 		ln1, e1 := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 		if e1 != nil {
 			continue
 		}
-		ln1.Close()
 		ln2, e2 := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port+1))
 		if e2 != nil {
+			ln1.Close()
 			continue
 		}
+		// Close listeners just before returning. A small race remains —
+		// another process can grab the port between Close and the test's
+		// real bind — so testNode and testCluster also retry on bind errors.
+		ln1.Close()
 		ln2.Close()
 		return port
 	}

@@ -216,6 +216,39 @@ backend, _ := s3.NewBackend(s3.Config{
 })
 ```
 
+## Mutual TLS
+
+Set `TLSConfig` to encrypt and authenticate every inter-node connection — both Raft replication traffic and the RPC channel used for leader forwarding (SQL writes, custom handlers, cluster join). When `nil` (default), all traffic is plaintext TCP.
+
+```go
+cert, _ := tls.LoadX509KeyPair("node.crt", "node.key")
+caPEM, _ := os.ReadFile("ca.crt")
+caPool := x509.NewCertPool()
+caPool.AppendCertsFromPEM(caPEM)
+
+node, _ := colmena.New(colmena.Config{
+    NodeID:    "node-1",
+    DataDir:   "./data",
+    Bind:      "0.0.0.0:9000",
+    Bootstrap: true,
+    TLSConfig: &tls.Config{
+        Certificates: []tls.Certificate{cert},
+        RootCAs:      caPool, // verifies peers we dial
+        ClientCAs:    caPool, // verifies peers that dial us (optional, falls back to RootCAs)
+        ServerName:   "colmena", // must match the SAN on peer certs
+    },
+})
+```
+
+How it works:
+
+- **mTLS is mandatory once enabled.** Inbound listeners are wrapped with `tls.RequireAndVerifyClientCert`, so every peer must present a certificate signed by a CA in `ClientCAs` (or `RootCAs` if `ClientCAs` is unset). There is no opportunistic / one-way TLS mode.
+- **Same config on every node.** All nodes in the cluster must agree: either all use TLS or none do. Mixing plaintext and TLS nodes will fail to handshake.
+- **Both ports are protected.** Raft transport (`Bind`) and the RPC server on `Bind+1` share the `TLSConfig`. Outbound dials from the RPC pool also use it — `ServerName` must resolve to a SAN on the peer's cert.
+- **Certificate hygiene is yours.** Colmena does not rotate certs or pin SPKIs; provide a `tls.Config` that already encodes your trust policy (custom `VerifyConnection`, cert reload, etc. all work because the config is passed through unchanged).
+
+For development, generate a single self-signed CA and one cert per node with `127.0.0.1` and the node hostname as SANs. For production, issue per-node certs from your internal PKI (Vault, step-ca, cert-manager) so revocation is possible.
+
 ## Reactive Hooks
 
 `OnApply` fires on every node (leader and followers) after each replicated write. Useful for real-time notifications, WebSocket broadcasts, cache invalidation, etc.
@@ -362,6 +395,7 @@ colmena.Config{
     BatchWindow       time.Duration     // Write batching window. Default: 2ms. Negative disables.
     BatchMaxSize      int               // Max commands per batch. Default: 128.
     UnsafeNoRaftLogFsync bool           // Skip fsync on Raft log. Faster but lossy. Default: false.
+    TLSConfig         *tls.Config       // Enables mTLS on Raft + RPC. Same config on every node. Default: nil (plaintext).
     LogOutput         io.Writer         // Raft log output. Default: os.Stderr.
     Backup            *BackupConfig     // Continuous backup config. Optional.
     OnApply           func(string, []Statement, []ExecResult)  // Reactive hook. Optional.

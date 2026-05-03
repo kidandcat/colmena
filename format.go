@@ -84,23 +84,3 @@ func decodeEnvelope(b []byte) (FormatKind, uint8, []byte, error) {
 	return FormatKind(b[8]), b[9], b[envelopeHeaderSize:], nil
 }
 
-// readEnvelopeHeader reads the 10-byte header from r. If the first 8 bytes
-// are not the magic, the error wraps errEnvelopeMagicMissing and the already-
-// consumed bytes are returned in `peeked` so the caller can feed them to a
-// legacy decoder. Callers are expected to buffer any additional bytes they
-// still need from r.
-func readEnvelopeHeader(r io.Reader) (kind FormatKind, version uint8, peeked []byte, err error) {
-	var hdr [envelopeHeaderSize]byte
-	n, err := io.ReadFull(r, hdr[:])
-	if err != nil {
-		return 0, 0, hdr[:n], err
-	}
-	for i, m := range envelopeMagic {
-		if hdr[i] != m {
-			return 0, 0, hdr[:], errEnvelopeMagicMissing
-		}
-	}
-	return FormatKind(hdr[8]), hdr[9], nil, nil
-}
-
-var errEnvelopeMagicMissing = errors.New("colmena: envelope magic missing")

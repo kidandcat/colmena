@@ -60,10 +60,12 @@ func (c *colmenaConn) ExecContext(ctx context.Context, query string, args []driv
 	iArgs := namedToAny(args)
 
 	if c.activeTx != nil {
+		res := &txExecResult{}
 		c.activeTx.mu.Lock()
 		c.activeTx.stmts = append(c.activeTx.stmts, Statement{SQL: query, Args: iArgs})
+		c.activeTx.results = append(c.activeTx.results, res)
 		c.activeTx.mu.Unlock()
-		return driver.RowsAffected(0), nil
+		return res, nil
 	}
 
 	cmd := &Command{
@@ -139,10 +141,11 @@ func (c *colmenaConn) leaderQuery(query string, args []any) (driver.Rows, error)
 // --- Transaction ---
 
 type colmenaTx struct {
-	conn  *colmenaConn
-	stmts []Statement
-	mu    sync.Mutex
-	done  bool
+	conn    *colmenaConn
+	stmts   []Statement
+	results []*txExecResult
+	mu      sync.Mutex
+	done    bool
 }
 
 func (tx *colmenaTx) Commit() error {
@@ -157,8 +160,21 @@ func (tx *colmenaTx) Commit() error {
 		return nil
 	}
 	cmd := &Command{Type: CommandExecuteMulti, DB: tx.conn.dbName, Statements: tx.stmts}
-	_, err := tx.conn.node.execute(cmd)
-	return err
+	applyResult, err := tx.conn.node.execute(cmd)
+	if err != nil {
+		for _, r := range tx.results {
+			r.fail(err)
+		}
+		return err
+	}
+	for i, r := range tx.results {
+		if i < len(applyResult.Results) {
+			r.fill(applyResult.Results[i])
+		} else {
+			r.fail(errors.New("colmena: missing result for transaction statement"))
+		}
+	}
+	return nil
 }
 
 func (tx *colmenaTx) Rollback() error {
@@ -170,6 +186,10 @@ func (tx *colmenaTx) Rollback() error {
 	tx.done = true
 	tx.conn.activeTx = nil
 	tx.stmts = nil
+	for _, r := range tx.results {
+		r.fail(ErrTxRolledBack)
+	}
+	tx.results = nil
 	return nil
 }
 
@@ -197,6 +217,64 @@ type execResult struct{ r ExecResult }
 
 func (r *execResult) LastInsertId() (int64, error) { return r.r.LastInsertID, nil }
 func (r *execResult) RowsAffected() (int64, error) { return r.r.RowsAffected, nil }
+
+// ErrTxResultPending is returned by RowsAffected/LastInsertId when called on a
+// driver.Result produced inside a *sql.Tx before the surrounding transaction
+// has been committed. Colmena buffers all writes inside a transaction and
+// applies them as a single Raft entry at Commit time, so per-statement row
+// counts are not available until Commit succeeds. After Commit, the result is
+// populated and RowsAffected/LastInsertId return the real values.
+var ErrTxResultPending = errors.New("colmena: transaction not yet committed; row count unavailable until Commit")
+
+// ErrTxRolledBack is returned by RowsAffected/LastInsertId when called on a
+// driver.Result whose surrounding transaction was rolled back.
+var ErrTxRolledBack = errors.New("colmena: transaction rolled back; result discarded")
+
+type txExecResult struct {
+	mu     sync.Mutex
+	filled bool
+	err    error
+	r      ExecResult
+}
+
+func (r *txExecResult) fill(res ExecResult) {
+	r.mu.Lock()
+	r.r = res
+	r.filled = true
+	r.err = nil
+	r.mu.Unlock()
+}
+
+func (r *txExecResult) fail(err error) {
+	r.mu.Lock()
+	r.err = err
+	r.filled = true
+	r.mu.Unlock()
+}
+
+func (r *txExecResult) LastInsertId() (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.filled {
+		return 0, ErrTxResultPending
+	}
+	if r.err != nil {
+		return 0, r.err
+	}
+	return r.r.LastInsertID, nil
+}
+
+func (r *txExecResult) RowsAffected() (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.filled {
+		return 0, ErrTxResultPending
+	}
+	if r.err != nil {
+		return 0, r.err
+	}
+	return r.r.RowsAffected, nil
+}
 
 // --- Rows ---
 

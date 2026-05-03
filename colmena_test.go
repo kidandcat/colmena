@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -273,6 +274,85 @@ func TestSingleNode_TransactionRollback(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("expected 0 rows after rollback, got %d", count)
+	}
+}
+
+// TestTransaction_RowsAffected guards against the BUG.md regression: an
+// UPDATE issued inside *sql.Tx silently returned RowsAffected=0 because the
+// driver buffered the statement and applied it at Commit time. The fix makes
+// the result lazy: pending until Commit, then populated with the real count.
+func TestTransaction_RowsAffected(t *testing.T) {
+	node := testNode(t)
+	db := node.DB()
+
+	if _, err := db.Exec("CREATE TABLE promo_codes (code TEXT PRIMARY KEY, redeemed_by TEXT, redeemed_at TEXT)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO promo_codes (code) VALUES (?)", "PMC7PPNL37NR"); err != nil {
+		t.Fatalf("seed row: %v", err)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+
+	res, err := tx.Exec(
+		`UPDATE promo_codes SET redeemed_by = ?, redeemed_at = ?
+		 WHERE code = ? AND redeemed_at IS NULL`,
+		"user-1", "2026-05-03T00:00:00Z", "PMC7PPNL37NR")
+	if err != nil {
+		t.Fatalf("tx exec: %v", err)
+	}
+
+	// Before Commit the row count must NOT be silently 0 — that was the
+	// original bug. It must surface ErrTxResultPending so callers can tell
+	// "I haven't run yet" apart from "the WHERE matched nothing".
+	if n, err := res.RowsAffected(); err == nil {
+		t.Fatalf("RowsAffected before commit: expected ErrTxResultPending, got n=%d err=nil", n)
+	} else if !errors.Is(err, ErrTxResultPending) {
+		t.Fatalf("RowsAffected before commit: expected ErrTxResultPending, got %v", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// After Commit the real row count must be available.
+	n, err := res.RowsAffected()
+	if err != nil {
+		t.Fatalf("RowsAffected after commit: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("RowsAffected after commit: expected 1, got %d", n)
+	}
+}
+
+// TestTransaction_RowsAffected_Rollback verifies a rolled-back transaction
+// surfaces ErrTxRolledBack from buffered results instead of leaving callers
+// blocked on ErrTxResultPending forever.
+func TestTransaction_RowsAffected_Rollback(t *testing.T) {
+	node := testNode(t)
+	db := node.DB()
+
+	if _, err := db.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	res, err := tx.Exec("INSERT INTO t (v) VALUES (?)", "x")
+	if err != nil {
+		t.Fatalf("tx exec: %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	if _, err := res.RowsAffected(); !errors.Is(err, ErrTxRolledBack) {
+		t.Fatalf("RowsAffected after rollback: expected ErrTxRolledBack, got %v", err)
 	}
 }
 

@@ -374,6 +374,37 @@ ctx := colmena.WithConsistency(ctx, colmena.ConsistencyStrong)
 rows, _ := logsDB.QueryContext(ctx, "SELECT ...")
 ```
 
+## TLS / mTLS
+
+By default, Raft transport (port `Bind`) and RPC (port `Bind+1`) are plaintext TCP. For clusters that span untrusted networks (different datacenters, public internet), set `Config.TLSConfig` to enable mutual TLS on **both** channels — every node authenticates the peer's certificate, and the listener rejects junk traffic at the TLS handshake instead of letting it walk into `net/rpc` or the Raft codec.
+
+```go
+cert, _ := tls.LoadX509KeyPair("node.crt", "node.key")
+caPEM, _ := os.ReadFile("ca.crt")
+pool := x509.NewCertPool()
+pool.AppendCertsFromPEM(caPEM)
+
+node, _ := colmena.New(colmena.Config{
+    NodeID:    "node-1",
+    DataDir:   "./data",
+    Bind:      "0.0.0.0:9000",
+    Advertise: "203.0.113.10:9000",
+    Bootstrap: true,
+    TLSConfig: &tls.Config{
+        Certificates: []tls.Certificate{cert},
+        RootCAs:      pool,  // verify peers when this node dials
+        ClientCAs:    pool,  // verify peers when this node accepts
+        MinVersion:   tls.VersionTLS12,
+    },
+})
+```
+
+Notes:
+
+- The same `*tls.Config` is used for client (dial) and server (accept). The server side is automatically upgraded to `tls.RequireAndVerifyClientCert`.
+- Each node cert needs a SAN matching the **address peers dial** — typically the IP in `Advertise` (e.g., `IP:203.0.113.10`). Without a matching SAN, peers reject the connection.
+- All nodes must run the same mode. A TLS node and a plaintext node cannot talk to each other; flip the cluster in lockstep, or do a rolling restart and tolerate a brief peer-reachability gap.
+
 ## Configuration
 
 ```go

@@ -204,17 +204,31 @@ func parseSegmentName(name string) (colmena.WALSegmentInfo, error) {
 
 const emptyPayloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" // sha256("")
 
+// unsignedPayload is the SigV4 payload hash used for streaming PUTs so multi-GB
+// objects never need a full in-memory read to compute SHA-256.
+const unsignedPayload = "UNSIGNED-PAYLOAD"
+
 func (b *Backend) put(ctx context.Context, key string, r io.Reader, size int64) error {
-	data, err := io.ReadAll(r)
+	// Prefer streaming when the caller knows the size (snapshot/WAL temps).
+	// Fall back to buffering only for unknown lengths.
+	var body io.Reader = r
+	payloadHash := unsignedPayload
+	if size < 0 {
+		data, err := io.ReadAll(r)
+		if err != nil {
+			return err
+		}
+		body = bytes.NewReader(data)
+		size = int64(len(data))
+		payloadHash = hexSHA256(data)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, "https://"+b.host+"/"+escapeKey(key), body)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, "https://"+b.host+"/"+escapeKey(key), bytes.NewReader(data))
-	if err != nil {
-		return err
-	}
+	req.ContentLength = size
 	req.Header.Set("Content-Type", "application/octet-stream")
-	b.sign(req, hexSHA256(data))
+	b.sign(req, payloadHash)
 	resp, err := b.http.Do(req)
 	if err != nil {
 		return err

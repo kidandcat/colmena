@@ -9,6 +9,13 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// Default SQLite pragmas for multi-GB databases with bounded memory.
+// Negative cache_size is KiB (64 MiB). mmap_size caps OS-level mapping (256 MiB).
+const (
+	defaultCacheSizeKiB = 64 << 10 // 64 MiB
+	defaultMmapSize     = 256 << 20 // 256 MiB
+)
+
 // store manages one local SQLite database with separate writer and reader pools.
 type store struct {
 	dbPath    string
@@ -19,7 +26,11 @@ type store struct {
 
 func newStoreAt(dbPath string, readConns int) (*store, error) {
 	// Writer: single connection, WAL mode, immediate transactions.
-	writerDSN := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_txlock=immediate", dbPath)
+	// mmap + cache_size keep multi-GB DBs from ballooning RSS unbounded.
+	writerDSN := fmt.Sprintf(
+		"file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-%d)&_pragma=mmap_size(%d)&_txlock=immediate",
+		dbPath, defaultCacheSizeKiB, defaultMmapSize,
+	)
 	writer, err := sql.Open("sqlite", writerDSN)
 	if err != nil {
 		return nil, fmt.Errorf("colmena: open writer: %w", err)
@@ -37,8 +48,11 @@ func newStoreAt(dbPath string, readConns int) (*store, error) {
 		return nil, fmt.Errorf("colmena: expected WAL mode, got %q", journalMode)
 	}
 
-	// Reader: multiple connections, read-only.
-	readerDSN := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&mode=ro", dbPath)
+	// Reader: multiple connections, read-only, same memory bounds.
+	readerDSN := fmt.Sprintf(
+		"file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=cache_size(-%d)&_pragma=mmap_size(%d)&mode=ro",
+		dbPath, defaultCacheSizeKiB, defaultMmapSize,
+	)
 	reader, err := sql.Open("sqlite", readerDSN)
 	if err != nil {
 		writer.Close()

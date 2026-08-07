@@ -1,7 +1,6 @@
 package colmena
 
 import (
-	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/rand"
@@ -125,9 +124,19 @@ type BackupConfig struct {
 	// works within this window. 0 keeps everything. Default: 30 days.
 	Retention time.Duration
 
-	// CheckpointThreshold is the WAL size (bytes) that, once fully shipped,
-	// triggers a TRUNCATE checkpoint to keep the WAL bounded. Default: 4 MiB.
+	// CheckpointThreshold is the WAL size (bytes) that, once fully *spooled*
+	// to local disk (not necessarily uploaded), triggers a TRUNCATE
+	// checkpoint. Default: 4 MiB.
 	CheckpointThreshold int64
+
+	// SegmentMaxBytes caps each uploaded WAL segment. Larger pending ranges
+	// are split so retries and memory stay bounded. Default: 4 MiB.
+	SegmentMaxBytes int64
+
+	// MaxWALBytes is a hard ceiling on the live SQLite WAL. Once the committed
+	// WAL reaches this size and is fully spooled, a checkpoint runs even if
+	// remote upload is lagging (spool holds the bytes). Default: 64 MiB.
+	MaxWALBytes int64
 
 	// OnError, when set, is invoked with the database name once a backup
 	// failure has persisted for AlertAfter consecutive syncs. Transient
@@ -161,6 +170,12 @@ func (c *BackupConfig) applyDefaults() {
 	if c.CheckpointThreshold == 0 {
 		c.CheckpointThreshold = 4 << 20
 	}
+	if c.SegmentMaxBytes == 0 {
+		c.SegmentMaxBytes = 4 << 20
+	}
+	if c.MaxWALBytes == 0 {
+		c.MaxWALBytes = 64 << 20
+	}
 	if c.AlertAfter == 0 {
 		c.AlertAfter = 5
 	}
@@ -177,9 +192,20 @@ type BackupStatus struct {
 	LastSyncAt     time.Time `json:"last_sync_at"`
 	LastSnapshotAt time.Time `json:"last_snapshot_at"`
 	WALIndex       int64     `json:"wal_index"`
-	WALOffset      int64     `json:"wal_offset"`
+	WALOffset      int64     `json:"wal_offset"` // bytes uploaded for current index
+	SpooledOffset  int64     `json:"spooled_offset"`
+	PendingSpool   int       `json:"pending_spool"`
 	LastError      string    `json:"last_error,omitempty"`
 	LastErrorAt    time.Time `json:"last_error_at,omitzero"`
+}
+
+// pendingSeg is one WAL chunk waiting for remote upload (already on local disk).
+type pendingSeg struct {
+	Generation string
+	Index      int64
+	Offset     int64
+	RawPath    string
+	RawSize    int64
 }
 
 // backupManager runs the continuous backup loop for one store.
@@ -189,15 +215,22 @@ type backupManager struct {
 	backend BackupBackend
 	cfg     BackupConfig
 	logf    func(format string, args ...any)
+	spool   string // local directory for pending segments + snapshot temps
 
-	mu         sync.Mutex
-	generation string
-	walIndex   int64
-	walOffset  int64 // committed bytes already shipped in the current index
-	salt1      uint32
-	salt2      uint32
-	status     BackupStatus
-	consecErrs int // consecutive failed syncs; reset on success (gates OnError)
+	// checkpointMu serialises checkpoint + reading the main DB / WAL for
+	// spooling so a concurrent snapshot cannot observe a mid-checkpoint file.
+	checkpointMu sync.Mutex
+
+	mu            sync.Mutex
+	generation    string
+	walIndex      int64
+	walOffset     int64 // committed bytes already *uploaded* in the current index
+	spooledOffset int64 // committed bytes already *spooled* in the current index
+	salt1         uint32
+	salt2         uint32
+	pending       []pendingSeg
+	status        BackupStatus
+	consecErrs    int // consecutive failed syncs; reset on success (gates OnError)
 
 	stopCh   chan struct{}
 	doneCh   chan struct{}
@@ -210,12 +243,17 @@ func newBackupManager(db string, st *store, cfg BackupConfig, logf func(string, 
 	if err != nil {
 		return nil, fmt.Errorf("colmena: backup backend for %q: %w", db, err)
 	}
+	spool := spoolDir(st.dbPath, db)
+	if err := os.MkdirAll(spool, 0o755); err != nil {
+		return nil, fmt.Errorf("colmena: create spool dir: %w", err)
+	}
 	return &backupManager{
 		db:      db,
 		store:   st,
 		backend: backend,
 		cfg:     cfg,
 		logf:    logf,
+		spool:   spool,
 		status:  BackupStatus{DB: db},
 		stopCh:  make(chan struct{}),
 		doneCh:  make(chan struct{}),
@@ -304,135 +342,244 @@ func (b *backupManager) Status() BackupStatus {
 	s.Generation = b.generation
 	s.WALIndex = b.walIndex
 	s.WALOffset = b.walOffset
+	s.SpooledOffset = b.spooledOffset
+	s.PendingSpool = len(b.pending)
 	return s
 }
 
-// sync ships any new committed WAL frames as one segment, then checkpoints
-// when the WAL has grown past the threshold and is fully shipped.
+// sync spools new committed WAL bytes to local disk (optionally checkpoints),
+// then uploads pending spool segments without holding locks during network I/O.
 func (b *backupManager) sync() error {
+	if err := b.spoolAndMaybeCheckpoint(); err != nil {
+		return err
+	}
+	return b.uploadPending()
+}
+
+// spoolAndMaybeCheckpoint copies new committed WAL ranges into the local
+// spool in SegmentMaxBytes chunks and TRUNCATEs the live WAL when fully
+// spooled and over CheckpointThreshold / MaxWALBytes — even if remote
+// upload is lagging.
+func (b *backupManager) spoolAndMaybeCheckpoint() error {
+	b.checkpointMu.Lock()
+	defer b.checkpointMu.Unlock()
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.generation == "" {
-		return nil // no snapshot yet
+		return nil
 	}
 
 	walPath := b.store.dbPath + "-wal"
 	hdr, committed, err := walCommittedSize(walPath)
 	if os.IsNotExist(err) {
-		return nil // no WAL (yet, or right after TRUNCATE)
+		return b.maybeCheckpointLocked(0)
 	}
 	if err != nil {
 		return fmt.Errorf("scan wal: %w", err)
 	}
 
-	// A salt change means SQLite reset the WAL (post-checkpoint): new index.
-	if b.walOffset > 0 && (hdr.salt1 != b.salt1 || hdr.salt2 != b.salt2) {
+	// Salt change: SQLite reset the WAL after a prior checkpoint we already
+	// spooled through. Start a new index; pending spool for the old index
+	// still uploads under its recorded (generation, index, offset).
+	if b.spooledOffset > 0 && (hdr.salt1 != b.salt1 || hdr.salt2 != b.salt2) {
 		b.walIndex++
+		b.spooledOffset = 0
 		b.walOffset = 0
 	}
-	if b.walOffset == 0 {
+	if b.spooledOffset == 0 {
 		b.salt1, b.salt2 = hdr.salt1, hdr.salt2
 	}
-	if committed <= b.walOffset {
-		return b.maybeCheckpoint(committed)
+
+	// Spool new committed bytes in bounded chunks.
+	for b.spooledOffset < committed {
+		start := b.spooledOffset
+		n := committed - start
+		if n > b.cfg.SegmentMaxBytes {
+			n = b.cfg.SegmentMaxBytes
+		}
+		// Align chunk end to a frame boundary when possible so a torn
+		// mid-frame is never spooled alone. The scan already stops at the
+		// last commit, so committed is frame-aligned; only the last chunk
+		// may be shorter than SegmentMaxBytes.
+		path := spoolRawPath(b.spool, b.generation, b.walIndex, start)
+		if err := copyRange(walPath, path, start, n); err != nil {
+			return fmt.Errorf("spool wal [%d,%d): %w", start, start+n, err)
+		}
+		b.pending = append(b.pending, pendingSeg{
+			Generation: b.generation,
+			Index:      b.walIndex,
+			Offset:     start,
+			RawPath:    path,
+			RawSize:    n,
+		})
+		b.spooledOffset = start + n
 	}
 
-	// Read the new committed byte range [walOffset, committed). A segment at
-	// offset 0 includes the 32-byte WAL header, so each index replays whole.
-	start := b.walOffset
-	f, err := os.Open(walPath)
-	if err != nil {
-		return fmt.Errorf("open wal: %w", err)
-	}
-	defer f.Close()
-	if _, err := f.Seek(start, io.SeekStart); err != nil {
-		return fmt.Errorf("seek wal: %w", err)
-	}
-	data := make([]byte, committed-start)
-	if _, err := io.ReadFull(f, data); err != nil {
-		return fmt.Errorf("read wal: %w", err)
-	}
-
-	seg := WALSegmentInfo{Index: b.walIndex, Offset: start, CreatedAt: b.cfg.now()}
-	gz, size, err := gzipBytes(data)
-	if err != nil {
-		return err
-	}
-	seg.Size = size
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	if err := b.backend.WriteWALSegment(ctx, b.generation, seg, gz, size); err != nil {
-		return fmt.Errorf("write segment: %w", err)
-	}
-	b.walOffset = committed
-	b.status.LastSyncAt = b.cfg.now()
-	return b.maybeCheckpoint(committed)
+	return b.maybeCheckpointLocked(committed)
 }
 
-// maybeCheckpoint TRUNCATEs the WAL once it is big and fully shipped. The
-// next write cycle re-creates it with fresh salts, which sync detects as a
-// new index. b.mu must be held.
-func (b *backupManager) maybeCheckpoint(committed int64) error {
-	if committed < b.cfg.CheckpointThreshold || b.walOffset != committed {
+// maybeCheckpointLocked TRUNCATEs when the WAL is fully spooled and either
+// past CheckpointThreshold or past MaxWALBytes. Does NOT require remote
+// upload to have caught up — the spool is the durable buffer. b.mu and
+// checkpointMu must be held.
+func (b *backupManager) maybeCheckpointLocked(committed int64) error {
+	if committed == 0 {
+		return nil
+	}
+	if b.spooledOffset != committed {
+		return nil // still spooling
+	}
+	need := committed >= b.cfg.CheckpointThreshold || committed >= b.cfg.MaxWALBytes
+	if !need {
 		return nil
 	}
 	if _, err := b.store.writer.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
 		return fmt.Errorf("checkpoint: %w", err)
 	}
-	// TRUNCATE can be a no-op when readers pin the WAL; only advance the
-	// index if the file actually shrank to zero. (If it didn't, the WAL keeps
-	// growing under the current index and we retry next time.)
+	// TRUNCATE can be a no-op when readers pin the WAL.
 	if st, err := os.Stat(b.store.dbPath + "-wal"); err == nil && st.Size() > 0 {
 		return nil
 	}
 	b.walIndex++
+	b.spooledOffset = 0
 	b.walOffset = 0
+	b.salt1, b.salt2 = 0, 0
 	return nil
 }
 
-// takeSnapshot opens a new generation: checkpoint (bounded WAL), snapshot via
-// the online backup API, upload, reset WAL tracking, prune old generations.
-func (b *backupManager) takeSnapshot() error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+// uploadPending ships every spooled segment to the backend. Network I/O runs
+// without holding mu or checkpointMu so writers and spooling are not blocked
+// by slow object storage.
+func (b *backupManager) uploadPending() error {
+	for {
+		b.mu.Lock()
+		if len(b.pending) == 0 {
+			b.mu.Unlock()
+			return nil
+		}
+		seg := b.pending[0]
+		b.mu.Unlock()
 
-	// Best-effort compaction so the snapshot covers everything and the new
-	// generation starts with an empty (or tiny) WAL.
+		if err := b.uploadOne(seg); err != nil {
+			return err
+		}
+
+		b.mu.Lock()
+		// Drop the head if it still matches (sync is single-threaded from
+		// the engine loop; tests call sync serially too).
+		if len(b.pending) > 0 &&
+			b.pending[0].RawPath == seg.RawPath {
+			b.pending = b.pending[1:]
+		}
+		// Advance uploaded offset for the live index when this segment
+		// belongs to the current generation/index and is contiguous.
+		if seg.Generation == b.generation && seg.Index == b.walIndex &&
+			seg.Offset == b.walOffset {
+			b.walOffset = seg.Offset + seg.RawSize
+		}
+		// After a checkpoint the live walIndex has moved on; segments for
+		// older indexes only need to land on the backend (already done).
+		if seg.Generation == b.generation && seg.Index < b.walIndex {
+			// older index fully handled when its last segment uploads; nothing
+			// to adjust on live offsets
+		}
+		b.status.LastSyncAt = b.cfg.now()
+		b.mu.Unlock()
+
+		_ = os.Remove(seg.RawPath)
+	}
+}
+
+func (b *backupManager) uploadOne(seg pendingSeg) error {
+	gzPath := seg.RawPath + ".gz"
+	size, err := copyFileGzip(seg.RawPath, gzPath)
+	if err != nil {
+		return fmt.Errorf("gzip spool: %w", err)
+	}
+	defer os.Remove(gzPath)
+
+	f, err := os.Open(gzPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	info := WALSegmentInfo{
+		Index:     seg.Index,
+		Offset:    seg.Offset,
+		Size:      size,
+		CreatedAt: b.cfg.now(),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := b.backend.WriteWALSegment(ctx, seg.Generation, info, f, size); err != nil {
+		return fmt.Errorf("write segment: %w", err)
+	}
+	return nil
+}
+
+// takeSnapshot opens a new generation: checkpoint, stream a page-faithful
+// gzip of the main DB file (bounded RAM), upload without holding locks,
+// then reset WAL tracking and prune.
+func (b *backupManager) takeSnapshot() error {
+	// Phase 1: exclusive checkpoint + stream main DB → local gzip temp.
+	// Concurrent writers only touch the WAL; we are the only checkpointer.
+	b.checkpointMu.Lock()
 	if _, err := b.store.writer.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
 		b.logf("colmena: backup %s: checkpoint before snapshot (non-fatal): %v", b.db, err)
 	}
 
-	// The snapshot is a literal copy of the main database file. This is safe
-	// and page-faithful by construction: auto-checkpointing is disabled and
-	// this engine (which holds b.mu) is the only checkpointer, so the main
-	// file cannot change while we read it — concurrent writes land in the
-	// WAL, and the new generation ships that WAL from byte 0, so replay
-	// covers anything the checkpoint above left behind. A compacted copy
-	// (VACUUM INTO / online backup into a fresh file) would renumber pages
-	// and corrupt WAL replay — do not "optimize" this back.
-	raw, err := os.ReadFile(b.store.dbPath)
+	// Page-faithful: literal file copy (not VACUUM INTO). Streaming gzip
+	// keeps multi-GB DBs off the Go heap.
+	tmpGz := filepath.Join(b.spool, "snapshot-"+NewGenerationID(b.cfg.now())+".db.gz")
+	size, err := copyFileGzip(b.store.dbPath, tmpGz)
+	b.checkpointMu.Unlock()
 	if err != nil {
-		return fmt.Errorf("read snapshot: %w", err)
+		return fmt.Errorf("stream snapshot: %w", err)
 	}
-	gz, size, err := gzipBytes(raw)
+	defer os.Remove(tmpGz)
+
+	// Phase 2: upload without locks.
+	gen := NewGenerationID(b.cfg.now())
+	f, err := os.Open(tmpGz)
 	if err != nil {
 		return err
 	}
-
-	gen := NewGenerationID(b.cfg.now())
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
-	if err := b.backend.WriteSnapshot(ctx, gen, gz, size); err != nil {
-		return fmt.Errorf("write snapshot: %w", err)
+	upErr := b.backend.WriteSnapshot(ctx, gen, f, size)
+	f.Close()
+	if upErr != nil {
+		return fmt.Errorf("write snapshot: %w", upErr)
 	}
 
+	// Phase 3: commit generation state; drop obsolete spool for prior gen.
+	b.mu.Lock()
+	oldPending := b.pending
 	b.generation = gen
 	b.walIndex = 0
 	b.walOffset = 0
+	b.spooledOffset = 0
 	b.salt1, b.salt2 = 0, 0
+	b.pending = nil
 	b.status.LastSnapshotAt = b.cfg.now()
+	b.mu.Unlock()
 
+	for _, p := range oldPending {
+		_ = os.Remove(p.RawPath)
+	}
+	// Remove any leftover spool files for this db.
+	if entries, err := os.ReadDir(b.spool); err == nil {
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name(), ".raw") || strings.HasSuffix(e.Name(), ".raw.gz") {
+				_ = os.Remove(filepath.Join(b.spool, e.Name()))
+			}
+		}
+	}
+
+	b.mu.Lock()
 	b.pruneLocked(ctx)
+	b.mu.Unlock()
 	return nil
 }
 
@@ -457,18 +604,6 @@ func (b *backupManager) pruneLocked(ctx context.Context) {
 			b.logf("colmena: backup %s: prune %s: %v", b.db, g.ID, err)
 		}
 	}
-}
-
-func gzipBytes(data []byte) (io.Reader, int64, error) {
-	var buf bytes.Buffer
-	gw := gzip.NewWriter(&buf)
-	if _, err := gw.Write(data); err != nil {
-		return nil, 0, err
-	}
-	if err := gw.Close(); err != nil {
-		return nil, 0, err
-	}
-	return bytes.NewReader(buf.Bytes()), int64(buf.Len()), nil
 }
 
 // ── Restore ─────────────────────────────────────────────────────────────────

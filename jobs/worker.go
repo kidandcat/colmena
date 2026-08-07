@@ -67,11 +67,8 @@ func (m *Manager) tryClaimAndRun() bool {
 		return false
 	}
 
-	// Atomic claim: status flip happens through Raft (leader-serialised),
-	// so the COUNT subqueries for concurrency and rate-limit are evaluated
-	// at the same moment as the WHERE id=? AND status='pending' guard.
-	// That gives us cluster-wide exactly-once semantics for both limits
-	// without a separate token bucket to keep in sync.
+	// Atomic claim: status flip + concurrency/rate-limit checks run in one
+	// UPDATE so a single process never double-claims the same job.
 	now := time.Now().UnixMilli()
 	res, err := m.node.DB().Exec(
 		`UPDATE colmena_jobs

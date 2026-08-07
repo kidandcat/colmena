@@ -1,8 +1,8 @@
-// Package jobs adds a distributed background-job system on top of a
-// Colmena node. Jobs are persisted in the same replicated SQLite store and
-// claimed through Raft, so a job runs on exactly one node across the
-// cluster, survives leader changes, and is restored from snapshot/backup
-// like any other row.
+// Package jobs adds a durable background-job system on top of a Colmena
+// node. Jobs are persisted in the same SQLite store and survive process
+// restarts (and restore-from-backup) like any other row. Colmena v2 is
+// single-process: claim is local atomic SQL, not a multi-node consensus
+// protocol.
 //
 // # Quick start
 //
@@ -33,11 +33,11 @@
 //
 //	jobs.Schedule(jm, "refresh-airing", "refresh_airing", "0 */6 * * *", RefreshArgs{})
 //
-// # Cluster-wide limits
+// # Concurrency limits
 //
-// SetConcurrency caps simultaneous executions of a job type cluster-wide;
-// SetRateLimit caps starts within a rolling window. Both checks are part
-// of the atomic claim UPDATE, so they are race-safe across nodes:
+// SetConcurrency caps simultaneous executions of a job type; SetRateLimit
+// caps starts within a rolling window. Both checks are part of the atomic
+// claim UPDATE:
 //
 //	jobs.SetConcurrency(jm, "scrape_justwatch", 2)
 //	jobs.SetRateLimit(jm,   "scrape_justwatch", jobs.Rate{N: 30, Per: time.Minute})

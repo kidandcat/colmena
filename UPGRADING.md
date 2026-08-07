@@ -4,6 +4,20 @@ v2 removes the raft cluster layer entirely. Colmena is now what it started
 as: embedded SQLite + continuous backup (litestream-style, with point-in-time
 restore). The last raft release is tagged `v0.13-raft-final`.
 
+## v2.1 (streaming backup)
+
+No API break for callers. Behavioural improvements for multi-GB DBs / high WPS:
+
+- Snapshots stream through gzip (bounded RAM).
+- WAL is spooled locally in `SegmentMaxBytes` chunks under
+  `<DataDir>/.colmena-spool/<db>/`, then uploaded without holding engine locks.
+- Checkpoints run when the WAL is fully **spooled** (not only when S3 has
+  caught up). `MaxWALBytes` forces a checkpoint under upload outages.
+- New `BackupConfig` fields (all optional, defaults applied): `SegmentMaxBytes`
+  (4 MiB), `MaxWALBytes` (64 MiB).
+- `BackupStatus` gains `SpooledOffset` and `PendingSpool`.
+- Store connections set `cache_size` (−64 MiB) and `mmap_size` (256 MiB).
+
 ## Source compatibility
 
 Existing single-node callers compile unchanged:

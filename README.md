@@ -105,7 +105,29 @@ node, err := colmena.New(cfg)
 - Restore lays down the snapshot, replays each WAL index in order (SQLite's
   own WAL recovery does the applying), and finishes with `integrity_check`.
 
-Defaults: sync 1s · snapshot 24h · retention 30d · checkpoint 4 MiB.
+Defaults: sync 1s · snapshot 24h · retention 30d · checkpoint 4 MiB ·
+WAL segment 4 MiB · hard WAL cap 64 MiB.
+
+### Scale notes (v2.1+)
+
+Designed for **multi-GB databases** and high write rates (with batched
+transactions):
+
+- **Streaming snapshots** — gzip of the main DB file is written with a fixed
+  buffer (never `ReadFile` the whole DB into RAM).
+- **Chunked WAL spool** — pending WAL is copied to a local spool in
+  `SegmentMaxBytes` pieces, then uploaded without holding locks.
+- **Checkpoint decoupled from S3** — once the WAL is fully spooled, it can
+  TRUNCATE even if object-storage Put is failing (`MaxWALBytes` hard cap).
+- **Bounded page cache / mmap** on every connection (64 MiB cache, 256 MiB mmap).
+
+Benches (from repo root):
+
+```bash
+go test -bench=BenchmarkWrite -benchmem .
+go test -bench=BenchmarkSnapshotStream -benchtime=3x .
+COLMENA_BENCH_MB=64 go test -bench=BenchmarkSnapshotStream -benchtime=1x .
+```
 
 ## License
 

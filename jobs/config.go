@@ -34,15 +34,12 @@ type Config struct {
 	// RetainTerminal is how long a job in a terminal state (succeeded or dead)
 	// is kept before the reaper deletes it. Enqueue/claim/finalise never remove
 	// rows — a completed job just flips to 'succeeded' — so without reaping the
-	// colmena_jobs table grows without bound. That bloats the store and, because
-	// every Raft snapshot copies the whole database, inflates snapshot size and
-	// memory until nodes OOM. Default: 24h. Set to a negative duration to
-	// disable reaping and keep all history.
+	// colmena_jobs table grows without bound and bloats continuous backups.
+	// Default: 24h. Set to a negative duration to disable reaping and keep all
+	// history.
 	RetainTerminal time.Duration
 
-	// ReapInterval is how often the leader deletes expired terminal jobs (and
-	// compacts the store once it holds enough free pages to be worth it).
-	// Default: 10m.
+	// ReapInterval is how often expired terminal jobs are deleted. Default: 10m.
 	ReapInterval time.Duration
 }
 

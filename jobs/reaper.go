@@ -5,19 +5,15 @@ import (
 	"time"
 )
 
-// reaperLoop runs on the leader and deletes terminal jobs (succeeded/dead)
-// older than config.RetainTerminal. finalise() only ever flips a completed job
-// to 'succeeded'/'dead' — it never deletes — so without this loop colmena_jobs
-// grows without bound and drags every Raft snapshot down with it.
+// reaperLoop deletes terminal jobs (succeeded/dead) older than
+// config.RetainTerminal. finalise() only ever flips a completed job to
+// 'succeeded'/'dead' — it never deletes — so without this loop colmena_jobs
+// grows without bound and bloats continuous backups of the store.
 //
-// We only need to bound the row COUNT: a Raft snapshot copies the store with
-// SQLite's VACUUM INTO / Online Backup path, which already emits a compacted
-// image, so deleting the rows is enough to shrink every future snapshot. The
-// physical file self-heals too — freed pages are reused by later inserts, and a
-// node that restores from a snapshot installs the compacted copy. We do NOT run
-// VACUUM here: colmena's writer opens with _txlock=immediate, so a replicated
-// `VACUUM` fails with "cannot VACUUM from within a transaction" under load, and
-// it would be redundant anyway.
+// We only need to bound the row COUNT: freed pages are reused by later
+// inserts. We do NOT run VACUUM here: the writer opens with
+// _txlock=immediate, so VACUUM under load is painful and unnecessary for
+// correctness.
 func (m *Manager) reaperLoop() {
 	defer m.wg.Done()
 

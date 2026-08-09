@@ -12,7 +12,7 @@ import (
 // Default SQLite pragmas for multi-GB databases with bounded memory.
 // Negative cache_size is KiB (64 MiB). mmap_size caps OS-level mapping (256 MiB).
 const (
-	defaultCacheSizeKiB = 64 << 10 // 64 MiB
+	defaultCacheSizeKiB = 64 << 10  // 64 MiB
 	defaultMmapSize     = 256 << 20 // 256 MiB
 )
 

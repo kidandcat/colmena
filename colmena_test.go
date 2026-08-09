@@ -4,7 +4,9 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
+	"time"
 )
 
 func openTestNode(t *testing.T) (*Node, *sql.DB) {
@@ -132,5 +134,35 @@ func TestWALParser(t *testing.T) {
 	}
 	if committed2 != committed {
 		t.Fatalf("torn tail moved boundary: %d != %d", committed2, committed)
+	}
+}
+
+// TestOpenDBIsCached guards the leak fixed in 2.1.1: OpenDB used to call
+// sql.OpenDB on every invocation, so callers that fetched the handle per
+// query (the whole jobs package) leaked a *sql.DB — and the
+// connectionOpener goroutine that keeps its pool reachable — every time.
+func TestOpenDBIsCached(t *testing.T) {
+	node, db := openTestNode(t)
+
+	if got := node.DB(); got != db {
+		t.Fatal("DB() returned a different *sql.DB; handles must be cached")
+	}
+	if got := node.OpenDB("default", ConsistencyNone); got != db {
+		t.Fatal(`OpenDB("default") must return the same handle as DB()`)
+	}
+	if other := node.OpenDB("other", ConsistencyNone); other == db {
+		t.Fatal("OpenDB must return a distinct handle per database name")
+	}
+
+	before := runtime.NumGoroutine()
+	for range 200 {
+		if _, err := node.DB().Exec(`CREATE TABLE IF NOT EXISTS t (k TEXT)`); err != nil {
+			t.Fatalf("exec: %v", err)
+		}
+	}
+	// Allow the pool's bookkeeping goroutines to settle before counting.
+	time.Sleep(100 * time.Millisecond)
+	if grew := runtime.NumGoroutine() - before; grew > 10 {
+		t.Fatalf("goroutines grew by %d over 200 DB() calls; handle is leaking", grew)
 	}
 }

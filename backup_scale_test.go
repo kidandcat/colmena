@@ -250,7 +250,6 @@ func TestBackupNoLockDuringUpload(t *testing.T) {
 	// that blocks WriteWALSegment until a write has been observed.
 	inner, _ := NewLocalBackend(t.TempDir())
 	var (
-		mu      sync.Mutex
 		blocked = make(chan struct{})
 		proceed = make(chan struct{})
 		once    sync.Once
@@ -322,7 +321,6 @@ func TestBackupNoLockDuringUpload(t *testing.T) {
 	if err := <-errCh; err != nil {
 		t.Fatal(err)
 	}
-	_ = mu
 }
 
 type blockingWALBackend struct {

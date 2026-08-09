@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -16,6 +17,14 @@ type Node struct {
 	stores  *storeManager
 	logger  *log.Logger
 	backups map[string]*backupManager
+
+	// dbs caches one *sql.DB per database name. A *sql.DB is a long-lived
+	// pool, not a handle: every sql.OpenDB spawns a connectionOpener
+	// goroutine that keeps the whole pool reachable until Close, so handing
+	// out a fresh one per call leaks a goroutine and its idle connections
+	// on every DB() — unbounded for callers that fetch it per query.
+	dbMu sync.Mutex
+	dbs  map[string]*sql.DB
 }
 
 // New opens (or creates) the store rooted at cfg.DataDir.
@@ -34,6 +43,7 @@ func New(cfg Config) (*Node, error) {
 		stores:  newStoreManager(cfg.DataDir, cfg.SQLiteReadConns),
 		logger:  log.New(cfg.LogOutput, "", log.LstdFlags),
 		backups: map[string]*backupManager{},
+		dbs:     map[string]*sql.DB{},
 	}
 
 	// Attach the backup engine to every store as it opens (including the
@@ -61,11 +71,22 @@ func (n *Node) DB() *sql.DB {
 	return n.OpenDB("default", ConsistencyNone)
 }
 
-// OpenDB returns a *sql.DB for the named database (created on first use as
+// OpenDB returns the *sql.DB for the named database (created on first use as
 // <DataDir>/<name>.db). The consistency argument is a v1 leftover and has no
 // effect — reads are always local.
+//
+// The handle is cached and owned by the Node: repeated calls return the same
+// *sql.DB, and Close releases it. Callers must not Close it themselves — it
+// is safe (and cheap) to call this per query.
 func (n *Node) OpenDB(name string, consistency ConsistencyLevel) *sql.DB {
-	return sql.OpenDB(&colmenaConnector{node: n, dbName: name})
+	n.dbMu.Lock()
+	defer n.dbMu.Unlock()
+	if db, ok := n.dbs[name]; ok {
+		return db
+	}
+	db := sql.OpenDB(&colmenaConnector{node: n, dbName: name})
+	n.dbs[name] = db
+	return db
 }
 
 // BackupStatus reports the state of the backup engine per database. Empty
@@ -79,7 +100,8 @@ func (n *Node) BackupStatus() map[string]BackupStatus {
 	return out
 }
 
-// Close stops the backup engines (after a final sync) and closes every store.
+// Close stops the backup engines (after a final sync), releases the cached
+// *sql.DB handles and closes every store.
 func (n *Node) Close() error {
 	for _, bm := range n.backups {
 		bm.stop()
@@ -87,6 +109,12 @@ func (n *Node) Close() error {
 	for _, bm := range n.backups {
 		bm.backend.Close()
 	}
+	n.dbMu.Lock()
+	for name, db := range n.dbs {
+		db.Close()
+		delete(n.dbs, name)
+	}
+	n.dbMu.Unlock()
 	return n.stores.close()
 }
 
